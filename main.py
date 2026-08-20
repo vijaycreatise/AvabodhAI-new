@@ -15,12 +15,31 @@ from utils.logger import get_logger
 from api.routes import search
 from api.routes import chat
 from api.routes.web import router as web_router
+from api.routes import kb
+from config.settings import get_settings
 
 logger = get_logger(__name__)
 settings = get_settings()
 
 _DEFAULT_SECRET_KEY = "dev-only-CHANGE-ME-in-production"
 _DEFAULT_APP_DB_PASSWORD = "CHANGE-ME-app-role-password"
+
+
+def _apply_langsmith_env() -> None:
+    """
+    Push LangSmith + OpenAI settings into os.environ so that LangChain
+    picks them up at import time regardless of load order.
+    """
+    s = get_settings()
+    os.environ.setdefault("OPENAI_API_KEY", s.OPENAI_API_KEY)
+    os.environ.setdefault("LANGCHAIN_TRACING_V2", s.LANGCHAIN_TRACING_V2)
+    os.environ.setdefault("LANGCHAIN_ENDPOINT", s.LANGCHAIN_ENDPOINT)
+    os.environ.setdefault("LANGCHAIN_PROJECT", s.LANGCHAIN_PROJECT)
+    if s.LANGCHAIN_API_KEY:
+        os.environ.setdefault("LANGCHAIN_API_KEY", s.LANGCHAIN_API_KEY)
+
+
+_apply_langsmith_env()
 
 
 @asynccontextmanager
@@ -87,6 +106,7 @@ app.include_router(documents.router, prefix="/documents", tags=["Documents"])
 app.include_router(chat.router, prefix="/chat", tags=["Chat"])
 app.include_router(search.router, prefix="/search", tags=["Search"])
 app.include_router(web_router, prefix="/web", tags=["Web Scraping"])
+app.include_router(kb.router, prefix="/kb", tags=["Knowledge Base"])
 
 
 @app.get("/", tags=["Root"])

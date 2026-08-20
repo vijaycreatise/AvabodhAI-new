@@ -16,7 +16,7 @@ from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import (
     Column, DateTime, Integer, String, Text, Float,
-    Index, ForeignKey, JSON, Boolean
+    Index, ForeignKey, JSON, Boolean, Enum
 )
 from sqlalchemy.dialects.postgresql import UUID, ARRAY, TSVECTOR
 from sqlalchemy.orm import DeclarativeBase, relationship
@@ -378,3 +378,38 @@ class ChatMessage(Base):
 
     def __repr__(self) -> str:
         return f"<ChatMessage role={self.role} thread={self.thread_id}>"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. Knowledge Base (KB) Tables
+# ─────────────────────────────────────────────────────────────────────────────
+
+class KBDocument(Base):
+    __tablename__ = "kb_documents"
+
+    id            = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    owner_id      = Column(String(256), nullable=False, index=True)
+    file_name     = Column(String(512), nullable=False)
+    status        = Column(
+        Enum("processing", "ready", "failed", name="kb_document_status"),
+        nullable=False,
+        default="processing",
+    )
+    error_message = Column(Text, nullable=True)
+    created_at    = Column(DateTime(timezone=True),
+                           default=lambda: datetime.now(timezone.utc), nullable=False)
+
+
+class KBChatHistory(Base):
+    __tablename__ = "kb_chat_history"
+
+    id              = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    conversation_id = Column(String(256), nullable=False, index=True)
+    owner_id        = Column(String(256), nullable=False, index=True)
+    role            = Column(
+        Enum("human", "ai", name="kb_chat_role"),
+        nullable=False,
+    )
+    content         = Column(Text, nullable=False)
+    created_at      = Column(DateTime(timezone=True),
+                           default=lambda: datetime.now(timezone.utc), nullable=False)

@@ -329,3 +329,34 @@ def get_db_session_fastapi(request: Request) -> Generator[Session, None, None]:
         raise
     finally:
         session.close()
+
+
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from typing import AsyncGenerator
+
+async_engine = create_async_engine(
+    settings.async_db_url,
+    pool_size=settings.DB_POOL_SIZE,
+    max_overflow=settings.DB_MAX_OVERFLOW,
+    pool_timeout=settings.DB_POOL_TIMEOUT,
+    pool_pre_ping=True,
+    echo=False,
+)
+
+AsyncSessionFactory = async_sessionmaker(
+    bind=async_engine,
+    autoflush=False,
+    autocommit=False,
+    class_=AsyncSession,
+)
+
+
+async def get_async_db_session_fastapi() -> AsyncGenerator[AsyncSession, None]:
+    """FastAPI dependency injection version for async routes."""
+    async with AsyncSessionFactory() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise

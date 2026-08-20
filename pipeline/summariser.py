@@ -19,6 +19,10 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from langchain_openai import ChatOpenAI
+try:
+    from langchain_ollama import ChatOllama
+except ImportError:
+    ChatOllama = None
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
 from langchain_core.output_parsers import StrOutputParser
@@ -132,6 +136,21 @@ SECTION SUMMARIES:
 
 
 def _build_llm(max_tokens: int) -> ChatOpenAI:
+    if settings.use_ollama:
+        if ChatOllama is not None:
+            return ChatOllama(
+                model=settings.OLLAMA_CHAT_MODEL,
+                base_url=settings.ollama_url,
+                temperature=settings.LLM_TEMPERATURE,
+                max_tokens=max_tokens,
+            )
+        return ChatOpenAI(
+            api_key="ollama",
+            base_url=f"{settings.ollama_url.rstrip('/')}/v1",
+            model=settings.OLLAMA_CHAT_MODEL,
+            temperature=settings.LLM_TEMPERATURE,
+            max_tokens=max_tokens,
+        )
     return ChatOpenAI(
         api_key=settings.OPENAI_API_KEY,
         model=settings.MAP_MODEL,

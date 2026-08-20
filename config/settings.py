@@ -7,12 +7,16 @@ Never hardcode secrets — use .env file locally, secrets manager in production.
 
 import os
 from functools import lru_cache
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
+from urllib.error import HTTPError, URLError
+from urllib.request import urlopen
+
+from pydantic import field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
-    # ── LLM ───────────────────────────────────────────────────────────────
     # ── LLM ───────────────────────────────────────────────────────────────
     # Ollama runs locally — no API key needed
     HUGGINGFACEHUB_API_TOKEN: str = ""   # keep empty, not used anymore
@@ -20,14 +24,21 @@ class Settings(BaseSettings):
     MAP_MODEL: str = "llama3.2"
     REDUCE_MODEL: str = "llama3.2"
     EMBEDDING_MODEL: str = "nomic-embed-text"   # local embedding model for Ollama
-    # ── pgvector 
+    # ── pgvector
     EMBEDDING_DIMENSIONS: int = 1536    # text-embedding-3-small = 1536
                                      # text-embedding-3-large = 3072
     EMBEDDING_BATCH_SIZE: int = 100     # chunks per batch to OpenAI
 
-    #OLLAMA_BASE_URL: str = "http://localhost:11434"  # default Ollama port
+    OLLAMA_BASE_URL: str = "http://localhost:11434"
+    OLLAMA_DOCKER_BASE_URL: str = "http://host.docker.internal:11434"
+    OLLAMA_CHAT_MODEL: str = "llama3.2"
+    OLLAMA_EMBEDDING_MODEL: str = "nomic-embed-text"
+    OLLAMA_EMBEDDING_DIMENSIONS: int = 768
+
     GROQ_API_KEY: str = ""
     OPENAI_API_KEY: str = ""
+    LLM_PROVIDER: str = "auto"
+    PYTHON_KB_INTERNAL_URL: str = "http://localhost:8000"
 
     MAP_MAX_TOKENS: int = 512
     REDUCE_MAX_TOKENS: int = 1024
@@ -54,85 +65,108 @@ class Settings(BaseSettings):
     DB_MAX_OVERFLOW: int = 10
     DB_POOL_TIMEOUT: int = 30
 
-    # ── Restricted application role — used for ALL normal request-serving
-    # queries. DB_USER/DB_PASSWORD above (typically the Postgres superuser
-    # in this docker-compose setup) are used ONLY once, at startup, to
-    # bootstrap the schema (create tables, the FTS trigger, this role
-    # itself, and the Row-Level Security policies below).
-    #
-    # This separation exists because Postgres RLS CANNOT restrict a
-    # superuser's queries, ever, by design — no policy setting or FORCE
-    # clause changes that. If the application connected using the same
-    # superuser credentials for everything, the RLS policies below would
-    # provide zero real protection for the app's own traffic. This role
-    # is deliberately NOT a superuser and does NOT have BYPASSRLS, so RLS
-    # actually applies to it.
-    #
-    # Anyone (including teammates in pgAdmin) who wants tenant/org-unit
-    # isolation to actually bound their ad-hoc queries must connect using
-    # THESE credentials, not DB_USER/DB_PASSWORD. Connecting as the
-    # superuser bypasses every isolation guarantee in this document —
-    # see the reference document for the full explanation.
     APP_DB_USER: str = "avabodh_app"
     APP_DB_PASSWORD: str = "CHANGE-ME-app-role-password"
 
-    # ── Full-text search / hybrid search ────────────────────────────────────
-    FTS_LANGUAGE: str = "english"          # Postgres text search config used by the trigger and keyword queries
-    HYBRID_RRF_K: int = 60                 # Reciprocal Rank Fusion constant — standard default (same as Elasticsearch's)
+    FTS_LANGUAGE: str = "english"
+    HYBRID_RRF_K: int = 60
 
-    # ── Document loader ────────────────────────────────────────────────────
     DOCUMENTS_DIR: str = "./documents"
     SUPPORTED_EXTENSIONS: list[str] = [".pdf", ".txt", ".docx", ".csv"]
 
-    # ── Image pipeline (GPT-4o Vision) ─────────────────────────────────────
     VISION_MODEL: str = "gpt-4o"
-    IMAGE_MIN_SIZE_BYTES: int = 5000       # images smaller than this are treated as noise (icons, tracking pixels)
-    IMAGE_MAX_DIMENSION: int = 1024        # resize longest side to this before sending to Vision
-    IMAGE_MAX_WORKERS: int = 4             # ThreadPoolExecutor size for parallel image embedding
+    IMAGE_MIN_SIZE_BYTES: int = 5000
+    IMAGE_MAX_DIMENSION: int = 1024
+    IMAGE_MAX_WORKERS: int = 4
 
-    # ── Signed preview file links ───────────────────────────────────────────
-    # A plain <a href> or <iframe src> can't carry X-Tenant-ID/X-Org-Unit-ID
-    # headers, so the document-file endpoint is authorized via a short-lived
-    # HMAC-signed token in the URL instead. SECRET_KEY MUST be overridden in
-    # production — the default below is fine for local dev only, and is
-    # deliberately obviously-not-secret so nobody mistakes it for a real one.
     SECRET_KEY: str = "dev-only-CHANGE-ME-in-production"
-    # Product decision (lead architect, confirmed): preview links do NOT
-    # expire — None means generate_file_token() embeds no expiry at all.
-    # Set this to a number of seconds if that decision ever changes; the
-    # mechanism to re-enable expiry is still fully in place, just unused
-    # by default. See utils/signed_link.py verify_file_token() for the
-    # security tradeoff this represents.
     FILE_LINK_TTL_SECONDS: Optional[int] = None
-
-    # ── Public base URL for preview_link ────────────────────────────────────
-    # Empty by default — the API auto-detects the correct host from the
-    # incoming request (request.base_url), which is correct for direct
-    # local/dev access. Set this explicitly once the API sits behind the
-    # Security Gateway or any reverse proxy: auto-detection would then see
-    # the internal request (e.g. http://avabodh_api:8000/), not the public
-    # address an end user's browser can actually reach — set this to the
-    # real public URL (e.g. https://api.clariona.com) to override it.
     PUBLIC_BASE_URL: str = ""
 
-
-    # ── Logging ────────────────────────────────────────────────────────────
     LOG_LEVEL: str = "INFO"
     LOG_FILE: str = "avabodh.log"
 
-    # ── LangSmith tracing ──────────────────────────────────────────────────
-    # Get your key: https://smith.langchain.com -> Settings -> API Keys
-    # Set LANGCHAIN_TRACING_V2=true in .env to enable
     LANGCHAIN_TRACING_V2: str = "false"
     LANGCHAIN_ENDPOINT: str = "https://api.smith.langchain.com"
     LANGCHAIN_API_KEY: str = ""
     LANGCHAIN_PROJECT: str = "Avabodh Project"
 
     model_config = SettingsConfigDict(
-        env_file=".env",
+        env_file=None,
         env_file_encoding="utf-8",
         case_sensitive=True,
     )
+
+    def __init__(self, **data: Any):
+        merged = self._load_env_file_data()
+        merged.update(data)
+        super().__init__(**merged)
+
+    @classmethod
+    def _load_env_file_data(cls) -> dict[str, Any]:
+        paths = [
+            Path(__file__).resolve().parents[1] / "local_demo" / ".env",
+            Path(__file__).resolve().parents[1] / ".env",
+        ]
+        for env_path in paths:
+            if env_path.exists():
+                return cls._parse_env_file(env_path)
+        return {}
+
+    @staticmethod
+    def _parse_env_file(env_path: Path) -> dict[str, Any]:
+        data: dict[str, Any] = {}
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            data[key.strip()] = value.strip().strip('"').strip("'")
+        return data
+
+    @field_validator(
+        "DB_PORT",
+        "DB_POOL_SIZE",
+        "DB_MAX_OVERFLOW",
+        "DB_POOL_TIMEOUT",
+        "EMBEDDING_DIMENSIONS",
+        "EMBEDDING_BATCH_SIZE",
+        "MAP_MAX_TOKENS",
+        "REDUCE_MAX_TOKENS",
+        "LLM_REQUEST_TIMEOUT",
+        "LLM_MAX_RETRIES",
+        "MAX_CHUNK_SIZE",
+        "MIN_CHUNK_SIZE",
+        "IMAGE_MIN_SIZE_BYTES",
+        "IMAGE_MAX_DIMENSION",
+        "IMAGE_MAX_WORKERS",
+        "HYBRID_RRF_K",
+        mode="before",
+    )
+    @classmethod
+    def _blank_int_to_default(cls, value: Any) -> Any:
+        if value in ("", None):
+            return None
+        return value
+
+    def _ollama_health(self, base_url: str) -> bool:
+        try:
+            with urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=2) as response:
+                return response.status == 200
+        except (HTTPError, URLError, TimeoutError, OSError):
+            return False
+
+    @property
+    def use_ollama(self) -> bool:
+        if self.OPENAI_API_KEY:
+            return False
+        return self._ollama_health(self.ollama_url)
+
+    @property
+    def ollama_url(self) -> str:
+        if os.path.exists("/.dockerenv"):
+            return self.OLLAMA_DOCKER_BASE_URL
+        return self.OLLAMA_BASE_URL
 
     @property
     def db_url(self) -> str:

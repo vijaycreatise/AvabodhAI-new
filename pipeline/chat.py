@@ -16,6 +16,10 @@ import time
 from typing import AsyncGenerator, Optional
 
 from langchain_openai import ChatOpenAI
+try:
+    from langchain_ollama import ChatOllama
+except ImportError:
+    ChatOllama = None
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from config.settings import get_settings
@@ -26,6 +30,23 @@ settings = get_settings()
 
 
 def _build_llm(streaming: bool = False) -> ChatOpenAI:
+    if settings.use_ollama:
+        if ChatOllama is not None:
+            return ChatOllama(
+                model=settings.OLLAMA_CHAT_MODEL,
+                base_url=settings.ollama_url,
+                temperature=0.3,
+                max_tokens=1024,
+                streaming=streaming,
+            )
+        return ChatOpenAI(
+            api_key="ollama",
+            base_url=f"{settings.ollama_url.rstrip('/')}/v1",
+            model=settings.OLLAMA_CHAT_MODEL,
+            temperature=0.3,
+            max_tokens=1024,
+            streaming=streaming,
+        )
     return ChatOpenAI(
         api_key=settings.OPENAI_API_KEY,
         model=settings.MAP_MODEL,

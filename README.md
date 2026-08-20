@@ -281,6 +281,8 @@ uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
 Open `http://localhost:8000/docs`
 
+The API is also published on `http://localhost:4000` in Docker for compatibility with older client configs.
+
 ---
 
 ## Running with Docker (recommended)
