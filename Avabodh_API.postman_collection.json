@@ -1,7 +1,7 @@
 {
 	"info": {
 		"name": "Avabodh API",
-		"description": "Document Intelligence API \u2014 test all endpoints",
+		"description": "Document Intelligence API — test all endpoints",
 		"schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
 	},
 	"variable": [
@@ -41,13 +41,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -63,13 +63,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -85,13 +85,35 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
+							}
+						]
+					}
+				},
+				{
+					"name": "Qdrant Health",
+					"request": {
+						"method": "GET",
+						"url": "{{base_url}}/health/qdrant",
+						"description": "Check Qdrant (chunk/vector store) connection — new 2026-08-21 (Qdrant migration).",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required — every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -106,7 +128,7 @@
 					"request": {
 						"method": "POST",
 						"url": "{{base_url}}/documents/upload",
-						"description": "Upload PDF/TXT/DOCX/CSV \u2014 generates summary and saves to PostgreSQL",
+						"description": "Upload a document — now ASYNC (2026-08-21 Qdrant migration): registers immediately (status=UPLOADED) and ingests (extract/chunk/embed/index/summarise) in the background. Poll GET /documents/{id} for status. Supports PDF/DOCX/PPTX/XLSX/TXT/CSV/MD/HTML/images (unstructured-based extraction; standalone images go through GPT-4o Vision captioning instead).",
 						"body": {
 							"mode": "formdata",
 							"formdata": [
@@ -114,6 +136,12 @@
 									"key": "file",
 									"type": "file",
 									"description": "Select your PDF, TXT, DOCX or CSV file here"
+								},
+								{
+									"key": "metadata",
+									"value": "{\"country\":\"IN\",\"document_type\":\"POLICY\"}",
+									"type": "text",
+									"description": "NEW — JSON object of client metadata. Unknown keys are stored; allowlisted keys (category, country, state, department, classification, language, source, document_type) become filterable in /search/."
 								}
 							]
 						},
@@ -122,13 +150,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					},
@@ -170,13 +198,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -186,19 +214,19 @@
 					"request": {
 						"method": "GET",
 						"url": "{{base_url}}/documents/{{doc_id}}",
-						"description": "Get full summary by UUID \u2014 auto-filled after upload",
+						"description": "Get full summary by UUID — auto-filled after upload",
 						"header": [
 							{
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -212,13 +240,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						],
 						"url": {
@@ -232,7 +260,7 @@
 								"preview-url"
 							]
 						},
-						"description": "Dedicated endpoint \u2014 returns just a fresh preview_link, not the full document payload. Call this every time a user wants to view a document, rather than caching an old link."
+						"description": "Dedicated endpoint — returns just a fresh preview_link, not the full document payload. Call this every time a user wants to view a document, rather than caching an old link."
 					},
 					"response": []
 				},
@@ -251,19 +279,41 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						],
 						"body": {
 							"mode": "raw",
 							"raw": "{\n    \"doc_name\": \"My Renamed Document\"\n}"
 						}
+					}
+				},
+				{
+					"name": "Reprocess Document",
+					"request": {
+						"method": "POST",
+						"url": "{{base_url}}/documents/{{doc_id}}/reprocess",
+						"description": "Retry ingestion for a document — new 2026-08-21. Useful when status=FAILED (e.g. Qdrant was briefly unreachable during ingestion). Returns 202 with status=PROCESSING.",
+						"header": [
+							{
+								"key": "X-Tenant-ID",
+								"value": "{{tenant_id}}",
+								"type": "text",
+								"description": "Required — every endpoint is tenant-scoped."
+							},
+							{
+								"key": "X-Org-Unit-ID",
+								"value": "{{org_unit_id}}",
+								"type": "text",
+								"description": "Required — department-level isolation within the tenant."
+							}
+						]
 					}
 				},
 				{
@@ -277,13 +327,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -298,7 +348,7 @@
 					"request": {
 						"method": "POST",
 						"url": "{{base_url}}/documents/upload",
-						"description": "Should return 422 \u2014 .exe not allowed",
+						"description": "Should return 422 — .exe not allowed",
 						"body": {
 							"mode": "formdata",
 							"formdata": [
@@ -306,7 +356,7 @@
 									"key": "file",
 									"value": "fake content",
 									"type": "text",
-									"description": "test.exe \u2014 should be rejected"
+									"description": "test.exe — should be rejected"
 								}
 							]
 						},
@@ -315,13 +365,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -331,19 +381,19 @@
 					"request": {
 						"method": "GET",
 						"url": "{{base_url}}/documents/not-a-valid-uuid",
-						"description": "Should return 422 \u2014 invalid UUID format",
+						"description": "Should return 422 — invalid UUID format",
 						"header": [
 							{
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -353,19 +403,19 @@
 					"request": {
 						"method": "GET",
 						"url": "{{base_url}}/documents/00000000-0000-0000-0000-000000000000",
-						"description": "Should return 404 \u2014 document not found",
+						"description": "Should return 404 — document not found",
 						"header": [
 							{
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						]
 					}
@@ -375,7 +425,7 @@
 					"request": {
 						"method": "PATCH",
 						"url": "{{base_url}}/documents/{{doc_id}}",
-						"description": "Should return 422 \u2014 empty doc_name not allowed",
+						"description": "Should return 422 — empty doc_name not allowed",
 						"header": [
 							{
 								"key": "Content-Type",
@@ -385,13 +435,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						],
 						"body": {
@@ -414,13 +464,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							},
 							{
 								"key": "Content-Type",
@@ -446,7 +496,7 @@
 								}
 							}
 						},
-						"description": "Semantic + keyword combined via Reciprocal Rank Fusion. This is the default \u2014 omitting search_mode entirely does the same thing."
+						"description": "Semantic + keyword combined via Reciprocal Rank Fusion. This is the default — omitting search_mode entirely does the same thing."
 					},
 					"response": []
 				},
@@ -459,13 +509,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							},
 							{
 								"key": "Content-Type",
@@ -491,7 +541,7 @@
 								}
 							}
 						},
-						"description": "Vector similarity only \u2014 good for meaning-based queries, weak on exact codes/IDs."
+						"description": "Vector similarity only — good for meaning-based queries, weak on exact codes/IDs."
 					},
 					"response": []
 				},
@@ -504,13 +554,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							},
 							{
 								"key": "Content-Type",
@@ -536,7 +586,7 @@
 								}
 							}
 						},
-						"description": "Exact full-text match via chunk_tsvector \u2014 good for exact reference numbers, codes, acronyms."
+						"description": "Exact full-text match via chunk_tsvector — good for exact reference numbers, codes, acronyms."
 					},
 					"response": []
 				},
@@ -549,13 +599,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							}
 						],
 						"url": {
@@ -587,13 +637,13 @@
 								"key": "X-Tenant-ID",
 								"value": "{{tenant_id}}",
 								"type": "text",
-								"description": "Required \u2014 every endpoint is tenant-scoped."
+								"description": "Required — every endpoint is tenant-scoped."
 							},
 							{
 								"key": "X-Org-Unit-ID",
 								"value": "{{org_unit_id}}",
 								"type": "text",
-								"description": "Required \u2014 department-level isolation within the tenant."
+								"description": "Required — department-level isolation within the tenant."
 							},
 							{
 								"key": "Content-Type",

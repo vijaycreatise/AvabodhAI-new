@@ -1,104 +1,119 @@
 """
 tests/test_pipeline.py
 ----------------------
-Unit tests for each pipeline step.
+Unit tests for the Qdrant-migration pipeline (2026-08-21 rewrite).
+Rewritten because the previous version tested validate_summary()
+(pipeline/storage.py — removed, chunk storage no longer needs a Pydantic
+validator for pgvector rows) and split_documents() (pipeline/splitter.py —
+deleted, replaced by pipeline/chunker.py). No network/DB/Qdrant connection
+needed for any test below — everything here is pure-function logic.
+
 Run with: pytest tests/ -v
 """
 
 import pytest
-from unittest.mock import MagicMock, patch
-from langchain_core.documents import Document
 
-from db.models import DocumentSummaryOutput
-from pipeline.storage import validate_summary
-from pipeline.splitter import split_documents
+from pipeline.chunker import clean_extracted_text, is_meaningful_chunk
+from pipeline.retriever import build_filter, FILTERABLE_METADATA_KEYS
+from pipeline.vector_store import chunk_point_id
 
 
-# ── Pydantic validation tests ─────────────────────────────────────────────────
+# ── clean_extracted_text() ──────────────────────────────────────────────────
 
-def test_validate_summary_happy_path():
-    raw = {
-        "summary_text": "This document covers quarterly revenue targets.",
-        "chunk_count":  42,
-        "reduce_model": "gpt-4o-mini",
-    }
-    meta = {
-        "doc_name":    "report.pdf",
-        "source_path": "/docs/report.pdf",
-        "page_count":  10,
-    }
-    result = validate_summary(raw, meta)
-    assert isinstance(result, DocumentSummaryOutput)
-    assert result.doc_name == "report.pdf"
-    assert len(result.summary_text) > 0
+def test_clean_extracted_text_fixes_hyphenation():
+    text = "This is a long word: Aper-\nture that got split."
+    assert "Aperture" in clean_extracted_text(text)
 
 
-def test_validate_summary_cleans_whitespace():
-    raw = {
-        "summary_text": "   This   has   extra   spaces.   ",
-        "chunk_count": 1,
-        "reduce_model": "gpt-4o-mini",
-    }
-    meta = {"doc_name": "test.pdf", "source_path": "", "page_count": 1}
-    result = validate_summary(raw, meta)
-    assert "  " not in result.summary_text
+def test_clean_extracted_text_removes_standalone_page_numbers():
+    text = "Some real content.\n42\nMore real content."
+    cleaned = clean_extracted_text(text)
+    assert "\n42\n" not in cleaned
 
 
-def test_validate_summary_empty_fails():
-    raw = {"summary_text": "", "chunk_count": 1, "reduce_model": "gpt-4o-mini"}
-    meta = {"doc_name": "test.pdf", "source_path": "", "page_count": 1}
-    with pytest.raises(ValueError):
-        validate_summary(raw, meta)
+def test_clean_extracted_text_collapses_excess_newlines():
+    text = "Paragraph one.\n\n\n\n\nParagraph two."
+    assert "\n\n\n" not in clean_extracted_text(text)
 
 
-def test_validate_summary_doc_name_strips_path():
-    raw = {
-        "summary_text": "Valid summary content here.",
-        "chunk_count":  5,
-        "reduce_model": "gpt-4o-mini",
-    }
-    meta = {"doc_name": "/deep/nested/path/file.pdf", "source_path": "", "page_count": 1}
-    result = validate_summary(raw, meta)
-    assert result.doc_name == "file.pdf"
+# ── is_meaningful_chunk() ───────────────────────────────────────────────────
+
+def test_is_meaningful_chunk_rejects_short_text():
+    assert is_meaningful_chunk("Hi") is False
 
 
-# ── Chunk filtering tests ─────────────────────────────────────────────────────
+def test_is_meaningful_chunk_rejects_numbers_only():
+    text = "1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20"
+    assert is_meaningful_chunk(text) is False
 
-@patch("pipeline.splitter.SemanticChunker")
-@patch("pipeline.splitter.OpenAIEmbeddings")
-def test_small_chunks_discarded(mock_embeddings, mock_chunker):
-    tiny_doc  = Document(page_content="Hi", metadata={})
-    large_doc = Document(
-        page_content="This is a properly sized chunk with enough content to pass the minimum size filter.",
-        metadata={},
+
+def test_is_meaningful_chunk_accepts_real_prose():
+    text = (
+        "This is a properly sized chunk with enough real words and enough "
+        "alphabetic content to pass every one of the noise filters that "
+        "is_meaningful_chunk applies to a candidate chunk of text, and it "
+        "has been padded out with a few more clauses so it clears the "
+        "two-hundred-character minimum length check as well."
     )
-    mock_instance = MagicMock()
-    mock_instance.split_documents.return_value = [tiny_doc, large_doc]
-    mock_chunker.return_value = mock_instance
-
-    docs = [Document(page_content="test", metadata={})]
-    chunks = split_documents(docs)
-
-    # tiny_doc should be filtered out
-    for c in chunks:
-        assert len(c.page_content) >= 100
+    assert len(text) >= 200
+    assert is_meaningful_chunk(text) is True
 
 
-def test_chunk_index_added():
-    """Chunk metadata must include chunk_index for traceability."""
-    with patch("pipeline.splitter.SemanticChunker") as mock_chunker, \
-         patch("pipeline.splitter.OpenAIEmbeddings"):
-        docs_out = [
-            Document(
-                page_content="A" * 150,
-                metadata={"source": "test"},
-            )
-            for _ in range(3)
-        ]
-        mock_instance = MagicMock()
-        mock_instance.split_documents.return_value = docs_out
-        mock_chunker.return_value = mock_instance
+def test_is_meaningful_chunk_rejects_mostly_symbols():
+    text = "!@#$%^&*()_+-=[]{}|;':\",./<>?`~" * 10
+    assert is_meaningful_chunk(text) is False
 
-        chunks = split_documents([Document(page_content="test", metadata={})])
-        for i, chunk in enumerate(chunks):
-            assert chunk.metadata.get("chunk_index") == i
+
+# ── pipeline/retriever.py::build_filter() — the tenant-isolation chokepoint ──
+
+def test_build_filter_requires_tenant_and_defaults_org():
+    f = build_filter(tenant_id="tenant-a", org_unit_id="dept-1")
+    conditions = {c.key: c for c in f.must if hasattr(c, "key")}
+    assert conditions["tenant_id"].match.value == "tenant-a"
+    # org_unit_id defaults to [org_unit_id] when org_ids isn't supplied —
+    # this is what stops a bare tenant match from also matching every
+    # department within that tenant.
+    assert conditions["org_unit_id"].match.any == ["dept-1"]
+
+
+def test_build_filter_org_ids_widens_within_tenant_only():
+    f = build_filter(tenant_id="tenant-a", org_unit_id="dept-1", org_ids=["dept-1", "dept-2"])
+    conditions = {c.key: c for c in f.must if hasattr(c, "key")}
+    assert set(conditions["org_unit_id"].match.any) == {"dept-1", "dept-2"}
+    # tenant_id is never widened by org_ids — still exactly one tenant.
+    assert conditions["tenant_id"].match.value == "tenant-a"
+
+
+def test_build_filter_rejects_non_allowlisted_metadata_key():
+    with pytest.raises(ValueError):
+        build_filter(tenant_id="t", org_unit_id="o", metadata={"not_a_real_key": ["x"]})
+
+
+def test_build_filter_accepts_allowlisted_metadata_key():
+    key = next(iter(FILTERABLE_METADATA_KEYS))
+    f = build_filter(tenant_id="t", org_unit_id="o", metadata={key: ["IN"]})
+    conditions = {c.key: c for c in f.must if hasattr(c, "key")}
+    assert conditions[f"meta_{key}"].match.any == ["IN"]
+
+
+def test_build_filter_as_of_adds_effective_date_conditions():
+    import datetime
+    f = build_filter(tenant_id="t", org_unit_id="o", as_of=datetime.date(2026, 6, 1))
+    # Two extra should-style Filter sub-conditions get appended (one for
+    # effective_from, one for effective_to) beyond tenant_id + org_unit_id.
+    assert len(f.must) == 4
+
+
+# ── pipeline/vector_store.py::chunk_point_id() — idempotent upsert IDs ───────
+
+def test_chunk_point_id_is_deterministic():
+    id1 = chunk_point_id("doc-123", "text", 0)
+    id2 = chunk_point_id("doc-123", "text", 0)
+    assert id1 == id2
+
+
+def test_chunk_point_id_differs_by_role_and_index():
+    base = chunk_point_id("doc-123", "text", 0)
+    assert chunk_point_id("doc-123", "image", 0) != base
+    assert chunk_point_id("doc-123", "text", 1) != base
+    assert chunk_point_id("doc-456", "text", 0) != base
