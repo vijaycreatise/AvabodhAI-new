@@ -39,6 +39,7 @@ import asyncio
 import hashlib
 import os
 import re
+import sys
 import time
 from collections import deque
 from urllib.parse import urljoin, urlparse
@@ -48,6 +49,7 @@ from langchain_core.documents import Document
 from markdownify import markdownify as md
 
 from utils.logger import get_logger
+from utils.ssrf_guard import is_safe_scrape_target
 
 logger = get_logger(__name__)
 
@@ -266,7 +268,38 @@ def _normalize_url(url: str) -> str:
 # MODE 1 — Single page — UNCHANGED
 # ──────────────────────────────────────────────────────────────
 
-async def scrape_url_async(
+async def _install_ssrf_route_guard(page) -> None:
+    """
+    Abort any request whose target resolves to a private/internal address.
+
+    utils/ssrf_guard.py checks the URL we were GIVEN, before navigation. A
+    browser then follows redirects, so a public host answering
+    302 -> http://169.254.169.254/... reaches the metadata endpoint anyway:
+    the pre-flight check and the actual fetch are two separate resolutions
+    and only the first was guarded. DNS rebinding (a short-TTL record that
+    answers public at check time and internal at fetch time) defeats it the
+    same way.
+
+    Playwright's routing fires per REQUEST, including each redirect hop, so
+    the check happens where the connection is actually about to be made.
+    Subresources are covered too - an <img src="http://10.0.0.1/..."> can no
+    longer probe the internal network on the page's behalf.
+
+    No-ops when SCRAPER_ALLOW_PRIVATE_NETWORKS is set, matching the guard's
+    own escape hatch.
+    """
+    async def _route(route, request):
+        safe, reason = is_safe_scrape_target(request.url)
+        if safe:
+            await route.continue_()
+        else:
+            logger.warning("Blocked request to %s during scrape - %s", request.url, reason)
+            await route.abort()
+
+    await page.route("**/*", _route)
+
+
+async def _scrape_url_impl(
     url: str,
     wait_for_selector: str | None = None,
     extra_wait_ms: int = 1500,
@@ -295,6 +328,7 @@ async def scrape_url_async(
                 locale="en-US",
             )
             page = await context.new_page()
+            await _install_ssrf_route_guard(page)
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
             if wait_for_selector:
@@ -347,6 +381,7 @@ async def _fetch_one_page(
     async with semaphore:
         page = await context.new_page()
         try:
+            await _install_ssrf_route_guard(page)
             start = time.time()
             await page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
 
@@ -374,7 +409,7 @@ async def _fetch_one_page(
             await page.close()
 
 
-async def scrape_website_async(
+async def _scrape_website_impl(
     url: str,
     max_pages: int = 50,
     same_domain_only: bool = True,
@@ -487,6 +522,19 @@ async def scrape_website_async(
                             continue
                         if same_domain_only and urlparse(norm).netloc != root_domain:
                             continue
+                        # SSRF: only the SEED url was ever checked, by
+                        # api/routes/web.py. Every link discovered here is
+                        # attacker-influenced (it comes out of a fetched
+                        # page), and with same_domain_only=False - a plain
+                        # request field - the crawler would follow one to
+                        # any host at all, including 169.254.169.254 or an
+                        # internal service, and store what it found as a
+                        # retrievable document. Checked per-URL here, at the
+                        # point the target is actually chosen.
+                        safe, reason = is_safe_scrape_target(norm)
+                        if not safe:
+                            logger.warning("Skipping crawl link %s - %s", norm, reason)
+                            continue
                         queue.append(norm)
 
         finally:
@@ -495,6 +543,106 @@ async def scrape_website_async(
     logger.info("Crawl complete — %d pages scraped from %s", len(documents), url)
     return documents
 
+
+
+# ── Windows event-loop compatibility ─────────────────────────────────────────
+
+def _loop_can_spawn_subprocesses() -> bool:
+    """
+    Can the CURRENT event loop start a subprocess?
+
+    Playwright drives the browser through a child process, so it needs one.
+    On Windows only ProactorEventLoop supports that - SelectorEventLoop
+    raises NotImplementedError from create_subprocess_exec.
+
+    That combination happens in normal development. uvicorn picks its loop
+    like this (uvicorn/loops/asyncio.py):
+
+        if sys.platform == "win32" and not use_subprocess:
+            return asyncio.ProactorEventLoop
+        return asyncio.SelectorEventLoop
+
+    and use_subprocess is True whenever --reload is on. So `uvicorn main:app
+    --reload` on Windows silently produces a loop that cannot run
+    Playwright, and every /web/scrape call fails with a bare
+    NotImplementedError that says nothing about the real cause.
+
+    Always True on Linux/macOS, so this whole mechanism is inert in Docker
+    and in production.
+    """
+    if sys.platform != "win32":
+        return True
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return True
+    return isinstance(loop, asyncio.ProactorEventLoop)
+
+
+async def _run_with_subprocess_support(coro_factory):
+    """
+    Await a coroutine on a loop that can actually spawn subprocesses.
+
+    When the running loop already can (every non-Windows deployment, and
+    Windows without --reload), this just awaits it in place - no thread, no
+    behaviour change.
+
+    Otherwise the work runs on a dedicated thread with its own
+    ProactorEventLoop, and this coroutine waits for that thread without
+    blocking the server's loop. coro_factory is a callable rather than a
+    coroutine because a coroutine object is bound to the loop that created
+    it and cannot be handed to another one.
+    """
+    if _loop_can_spawn_subprocesses():
+        return await coro_factory()
+
+    logger.debug(
+        "Current event loop cannot spawn subprocesses (Windows + SelectorEventLoop, "
+        "typically 'uvicorn --reload') - running the browser on a dedicated Proactor loop."
+    )
+
+    def _runner():
+        loop = asyncio.ProactorEventLoop()
+        asyncio.set_event_loop(loop)
+        try:
+            return loop.run_until_complete(coro_factory())
+        finally:
+            asyncio.set_event_loop(None)
+            loop.close()
+
+    # to_thread propagates the return value AND any exception, so callers
+    # see exactly what they would have seen from a direct await.
+    return await asyncio.to_thread(_runner)
+
+
+async def scrape_url_async(
+    url: str,
+    wait_for_selector: str | None = None,
+    extra_wait_ms: int = 1500,
+    timeout_ms: int = 30_000,
+) -> list[Document]:
+    """Scrape one page. See _scrape_url_impl for the real work."""
+    return await _run_with_subprocess_support(
+        lambda: _scrape_url_impl(url, wait_for_selector, extra_wait_ms, timeout_ms)
+    )
+
+
+async def scrape_website_async(
+    url: str,
+    max_pages: int = 50,
+    same_domain_only: bool = True,
+    wait_for_selector: str | None = None,
+    extra_wait_ms: int = 1500,
+    timeout_ms: int = 30_000,
+    concurrency: int = _DEFAULT_CRAWL_CONCURRENCY,
+) -> list[Document]:
+    """Crawl a site. See _scrape_website_impl for the real work."""
+    return await _run_with_subprocess_support(
+        lambda: _scrape_website_impl(
+            url, max_pages, same_domain_only, wait_for_selector,
+            extra_wait_ms, timeout_ms, concurrency,
+        )
+    )
 
 def scrape_website(
     url: str,
