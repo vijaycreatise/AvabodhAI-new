@@ -16,6 +16,7 @@ build/
 # Virtual environment — never include in Docker
 venv/
 env/
+.venv/
 .env/
 
 # Environment files — never include secrets in image
