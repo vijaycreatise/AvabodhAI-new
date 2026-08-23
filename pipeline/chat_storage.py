@@ -23,10 +23,10 @@ from typing import Optional
 
 from sqlalchemy.orm import Session
 from sqlalchemy.orm import make_transient
-from langchain_openai import OpenAIEmbeddings
 
 from db.models import ChatThread, ChatMessage
 from db.database import get_db_session_context
+from pipeline import embedder, vector_store
 from config.settings import get_settings
 from utils.logger import get_logger
 
@@ -34,17 +34,23 @@ logger = get_logger(__name__)
 settings = get_settings()
 
 
-def _embed_text(text: str) -> Optional[list[float]]:
-    """Generate embedding for a message."""
+def _index_message_in_qdrant(message_id, tenant_id: str, org_unit_id: str, thread_id: str, role: str, content: str) -> None:
+    """
+    2026-08-21: chat-message vectors moved to Qdrant's avabodh_chat_messages
+    collection (ChatMessage.embedding/embedding_model columns removed —
+    see db/models.py). Non-fatal — GET /chat/search just won't find this
+    message if indexing fails, the message itself is still saved in Postgres.
+    """
     try:
-        client = OpenAIEmbeddings(
-            api_key=settings.OPENAI_API_KEY,
-            model=settings.EMBEDDING_MODEL,
+        dense_vector = embedder.embed_dense_query(content)
+        vector_store.upsert_chat_message(
+            message_id=str(message_id), tenant_id=tenant_id, org_unit_id=org_unit_id,
+            thread_id=str(thread_id), role=role, content=content,
+            dense_vector=dense_vector,
+            created_at=datetime.now(timezone.utc).isoformat(),
         )
-        return client.embed_query(text)
     except Exception as e:
-        logger.warning("Message embedding failed: %s", e)
-        return None
+        logger.warning("Chat message Qdrant indexing failed (non-fatal): %s", e)
 
 
 def create_thread(
@@ -107,11 +113,9 @@ def save_human_message(
     content: str,
 ) -> ChatMessage:
     """
-    Save human message as its own row.
-    Generates and stores embedding for semantic search.
+    Save human message as its own row. Indexed into Qdrant for
+    GET /chat/search (see _index_message_in_qdrant).
     """
-    embedding = _embed_text(content)
-
     with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         msg = ChatMessage(
             tenant_id       = tenant_id,
@@ -119,15 +123,16 @@ def save_human_message(
             thread_id       = uuid.UUID(thread_id),
             role            = "human",
             content         = content,
-            embedding       = embedding,
-            embedding_model = settings.EMBEDDING_MODEL if embedding else None,
         )
         session.add(msg)
         session.flush()
+        message_id = msg.id
         session.expunge(msg)
         make_transient(msg)
-        logger.info("Saved human message to thread %s", thread_id[:8])
-        return msg
+
+    _index_message_in_qdrant(message_id, tenant_id, org_unit_id, thread_id, "human", content)
+    logger.info("Saved human message to thread %s", thread_id[:8])
+    return msg
 
 
 def save_ai_message(
@@ -150,8 +155,6 @@ def save_ai_message(
     a user-attached image (multimodal chat). image_caption is the GPT-4o
     Vision caption of that image, kept for thread history / display.
     """
-    embedding = _embed_text(content)
-
     with get_db_session_context(tenant_id=tenant_id, org_unit_id=org_unit_id) as session:
         msg = ChatMessage(
             tenant_id         = tenant_id,
@@ -159,8 +162,6 @@ def save_ai_message(
             thread_id         = uuid.UUID(thread_id),
             role              = "ai",
             content           = content,
-            embedding         = embedding,
-            embedding_model   = settings.EMBEDDING_MODEL if embedding else None,
             sources           = sources or [],
             prompt_tokens     = prompt_tokens,
             completion_tokens = completion_tokens,
@@ -169,11 +170,14 @@ def save_ai_message(
         )
         session.add(msg)
         session.flush()
+        message_id = msg.id
         session.expunge(msg)
         make_transient(msg)
-        logger.info("Saved AI message to thread %s | sources=%d | has_image=%s",
-                   thread_id[:8], len(sources or []), has_image)
-        return msg
+
+    _index_message_in_qdrant(message_id, tenant_id, org_unit_id, thread_id, "ai", content)
+    logger.info("Saved AI message to thread %s | sources=%d | has_image=%s",
+               thread_id[:8], len(sources or []), has_image)
+    return msg
 
 
 def get_thread(thread_id: str, tenant_id: str, org_unit_id: str, db: Session) -> Optional[ChatThread]:
