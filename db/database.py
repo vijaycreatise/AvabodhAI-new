@@ -5,11 +5,11 @@ SQLAlchemy engines + session factories.
 
 TWO engines, deliberately, not one:
 
-  _admin_engine — connects using DB_USER/DB_PASSWORD (the Postgres
-  superuser in this docker-compose setup). Used ONLY inside init_db(),
-  ONLY for one-time schema bootstrap: creating tables, the full-text-
-  search trigger, the restricted app role, and the Row-Level Security
-  policies. Never used to serve a real request.
+  _admin_engine — connects using DB_USER/DB_PASSWORD, an externally
+  provisioned Postgres instance (not Docker-managed — see
+  scripts/init_schema.py). Used ONLY inside init_db(), ONLY for one-time
+  schema bootstrap: creating tables, the restricted app role, and the
+  Row-Level Security policies. Never used to serve a real request.
 
   engine — connects using APP_DB_USER/APP_DB_PASSWORD (a restricted,
   non-superuser role created by init_db()). This is what every real
@@ -22,11 +22,14 @@ RLS policies created below would provide zero real protection for the
 app's own traffic. This split is what makes RLS meaningful at all.
 """
 
+import os
+import time
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Generator, Optional
 
 from fastapi import Request
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.exc import OperationalError
 
@@ -52,8 +55,11 @@ engine = create_engine(
 
 SessionFactory = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
-# The 4 tables that carry tenant_id/org_unit_id and need RLS.
-_ISOLATED_TABLES = ["document_summaries", "document_chunks", "chat_threads", "chat_messages"]
+# The 3 tables that carry tenant_id/org_unit_id and need RLS. document_chunks
+# is gone as of 2026-08-21 — chunk data (and its tenant/org tags) now lives
+# in Qdrant, which has no RLS equivalent; pipeline/retriever.py::build_filter()
+# is the sole isolation control for chunks. See CLAUDE.md / the plan doc.
+_ISOLATED_TABLES = ["documents", "chat_threads", "chat_messages"]
 
 
 def _bootstrap_app_role(conn) -> None:
@@ -137,103 +143,141 @@ def _bootstrap_rls(conn) -> None:
     logger.info("Row-Level Security enabled + forced on: %s", ", ".join(_ISOLATED_TABLES))
 
 
-def _bootstrap_fts_trigger(conn) -> None:
-    """
-    Create the auto-update trigger that populates document_chunks.chunk_tsvector
-    from chunk_text on every INSERT/UPDATE. tsvector_update_trigger is a
-    Postgres BUILT-IN function — no custom PL/pgSQL function needed here,
-    just the trigger that calls it.
-
-    FTS_LANGUAGE is a fixed config (default 'english') applied to every
-    row regardless of the document's own detected language. This is a
-    known, deliberate limitation — good stemming/stopword handling for
-    non-English content would need a language-aware trigger variant
-    (tsvector_update_trigger_column, driven by a real regconfig column,
-    not the free-text `language` column this table already has). Worth
-    revisiting if non-English search quality turns out to matter; not
-    implemented here to avoid guessing at a design nobody's confirmed is
-    needed yet.
-    """
-    conn.execute(text("DROP TRIGGER IF EXISTS tsvectorupdate ON document_chunks"))
-    conn.execute(text(f"""
-        CREATE TRIGGER tsvectorupdate
-        BEFORE INSERT OR UPDATE ON document_chunks
-        FOR EACH ROW EXECUTE FUNCTION
-        tsvector_update_trigger(chunk_tsvector, 'pg_catalog.{settings.FTS_LANGUAGE}', chunk_text)
-    """))
-    logger.info("Full-text search trigger created on document_chunks (language=%s).", settings.FTS_LANGUAGE)
-
-
 def init_db() -> None:
     """
     Schema bootstrap — runs on every app startup, using the ADMIN engine
     only. Idempotent: safe to run repeatedly against an already-set-up
     database, which matters since this runs on every container start,
     not just the first one.
+
+    2026-08-21: no longer enables the pgvector extension or the FTS
+    trigger — chunk storage (and its embeddings/tsvector) moved to
+    Qdrant (pipeline/vector_store.py, scripts/init_qdrant.py). Postgres
+    now only needs the plain tables below.
     """
     try:
-        with _admin_engine.connect() as conn:
-            # Enable pgvector extension — must run before creating vector columns
-            conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
-            conn.commit()
-            logger.info("pgvector extension enabled.")
-
         Base.metadata.create_all(bind=_admin_engine)
         logger.info("Database tables verified / created successfully.")
 
         with _admin_engine.begin() as conn:
-            _bootstrap_fts_trigger(conn)
             _bootstrap_app_role(conn)
             _bootstrap_rls(conn)
+
+        mark_interrupted_jobs()
 
     except OperationalError as e:
         logger.critical("Cannot connect to PostgreSQL: %s", e)
         raise
 
 
-def backfill_tsvector(batch_size: int = 1000) -> int:
+def sweep_orphaned_uploads() -> int:
     """
-    Populate chunk_tsvector for rows that predate the trigger. New rows
-    are already covered automatically going forward — this is a one-time
-    catch-up for existing data, meant to be run explicitly by an
-    operator (see cli.py --backfill-tsvector), NOT automatically on
-    every startup. init_db() intentionally does not call this.
+    Startup cleanup for local upload files left behind by a dead process.
 
-    Batched deliberately, not one giant UPDATE — a single massive UPDATE
-    on a large existing table takes a long lock and a huge transaction;
-    Postgres's CREATE INDEX CONCURRENTLY-style caution applies here too.
-    This commits between batches so it stays safe to run against a live
-    table with real traffic, rather than stalling everything for however
-    long a full-table UPDATE would take.
+    2026-08-23, added alongside mark_interrupted_jobs() below and for the
+    same reason: ingestion is in-process (BackgroundTasks, no job queue), so
+    a crash/OOM/deploy-restart kills the job mid-flight. mark_interrupted_
+    jobs() repairs the Postgres row; this repairs the disk. Normally
+    pipeline/ingest.py deletes the local copy in its own finally block the
+    moment a job ends, so in steady state this finds nothing.
 
-    Uses the ADMIN engine, not the restricted app role — this needs to
-    see and fix every row across every tenant/department by design; it's
-    a deliberate maintenance operation invoked by an operator, not
-    something that should be scoped by RLS the way a real request is.
+    SAFETY RULE — a file is deleted ONLY when a document row proves S3
+    already holds it: source_path still records where the local scratch
+    file was written, while stored_path is rewritten to the s3:// URI once
+    the object is durably stored. Both must line up.
 
-    Returns total rows updated.
+    The first version of this deleted purely on age and destroyed five real
+    files on its first run: documents ingested before S3 existed still have
+    a LOCAL stored_path, so their upload was the only copy in the world and
+    nothing had ever put it in a bucket. Age alone can never tell "abandoned
+    scratch file" apart from "the user's only copy" — the S3 URI is the only
+    honest proof, so that is what is checked now. Anything unmatched is left
+    on disk: a stray file costs a few MB, and deleting the wrong one is
+    unrecoverable.
+
+    The age cutoff (settings.STORAGE_LOCAL_TTL_HOURS, default 4) is a second
+    guard on top of that, not the primary one. It is NOT a cache expiry: it
+    must stay well above the slowest real ingest, since measured wall time
+    for a 40-page PDF is 8-11.5 minutes and a 200-page document can exceed
+    40. Anything near 30 minutes could catch a job still parsing.
+
+    Returns the number of files removed.
     """
-    total_updated = 0
-    with _admin_engine.connect() as conn:
-        while True:
-            result = conn.execute(text(f"""
-                UPDATE document_chunks
-                SET chunk_tsvector = to_tsvector('pg_catalog.{settings.FTS_LANGUAGE}', chunk_text)
-                WHERE id IN (
-                    SELECT id FROM document_chunks
-                    WHERE chunk_tsvector IS NULL
-                    LIMIT :batch_size
-                )
-            """), {"batch_size": batch_size})
-            conn.commit()
-            updated = result.rowcount
-            total_updated += updated
-            if updated > 0:
-                logger.info("Backfilled %d rows (%d total so far)...", updated, total_updated)
-            if updated == 0:
-                break
-    logger.info("Backfill complete — %d rows updated.", total_updated)
-    return total_updated
+    from pipeline import object_store
+
+    if not object_store.is_enabled():
+        return 0
+
+    upload_dir = Path(settings.UPLOAD_DIR)
+    if not upload_dir.exists():
+        return 0
+
+    # Every local path that a document has SINCE migrated to S3. Only these
+    # are safe to remove. Admin engine: this must see across all tenants,
+    # not be scoped by RLS the way a real request is.
+    try:
+        with _admin_engine.connect() as conn:
+            rows = conn.execute(text("""
+                SELECT source_path FROM documents
+                WHERE stored_path LIKE 's3://%'
+                  AND source_path IS NOT NULL
+            """)).fetchall()
+    except Exception as e:
+        logger.warning("Orphan sweep skipped - could not read documents: %s", e)
+        return 0
+
+    safe_to_delete = {os.path.normcase(os.path.abspath(r[0])) for r in rows}
+    if not safe_to_delete:
+        return 0
+
+    cutoff = time.time() - (settings.STORAGE_LOCAL_TTL_HOURS * 3600)
+    removed = 0
+    # Iterate the KNOWN-SAFE paths, not the whole upload tree. rglob("*")
+    # made startup cost scale with everything on disk while only ever
+    # acting on this set, which is bounded by how many documents have
+    # actually migrated to S3.
+    for candidate in safe_to_delete:
+        path = Path(candidate)
+        if not path.is_file():
+            continue
+        try:
+            if path.stat().st_mtime > cutoff:
+                continue  # too recent to assume abandoned
+            path.unlink()
+            removed += 1
+        except OSError as e:
+            logger.warning("Could not sweep orphaned upload %s: %s", path, e)
+
+    if removed:
+        logger.info(
+            "Swept %d orphaned upload file(s) older than %dh whose original is in S3.",
+            removed, settings.STORAGE_LOCAL_TTL_HOURS,
+        )
+    return removed
+
+
+def mark_interrupted_jobs() -> int:
+    """
+    Startup crash recovery: any Document still in PROCESSING when the app
+    starts was mid-ingest when the previous process died (crash, OOM kill,
+    deploy restart) — background ingestion is in-process (BackgroundTasks,
+    no persistent job queue), so a dead process means that job is gone for
+    good, not resumable. Mark those FAILED so they show up as retryable
+    (POST /documents/{id}/reprocess) instead of hanging in PROCESSING
+    forever with no worker ever going to finish them.
+
+    Uses the ADMIN engine — this must see across every tenant/department,
+    not scoped by RLS the way a real request is.
+    """
+    with _admin_engine.begin() as conn:
+        result = conn.execute(text("""
+            UPDATE documents
+            SET status = 'FAILED', status_detail = 'interrupted by restart'
+            WHERE status = 'PROCESSING'
+        """))
+        if result.rowcount:
+            logger.warning("Marked %d interrupted document(s) as FAILED on startup.", result.rowcount)
+        return result.rowcount
 
 
 def check_db_connection() -> bool:
@@ -259,11 +303,38 @@ def _apply_rls_context(session: Session, tenant_id: Optional[str], org_unit_id: 
     interpolation — tenant_id/org_unit_id originate from HTTP headers,
     which are untrusted input, so this is the one place in this file
     where safe parameter binding is non-negotiable, not a nicety.
+
+    2026-08-23 — bound to the session's "after_begin" event rather than
+    executed once here, because "local to this transaction" cuts BOTH
+    ways: a commit ends that transaction, and every statement after it
+    runs in a NEW one where app.tenant_id/app.org_unit_id are back to
+    empty. The RLS policies then match zero rows, so any read after a
+    commit on the same session fails — confirmed live as
+    "InvalidRequestError: Could not refresh instance '<Document ...>'"
+    from PATCH /documents/{id} (api/routes/documents.py::update_document),
+    where the UPDATE committed fine and the db.refresh() right after it
+    came back empty. Note SQLAlchemy's expire_on_commit defaults to True,
+    so this is NOT limited to explicit refresh() calls — merely READING
+    an attribute off a committed instance triggers the same reload, and
+    would have hit the same wall. Re-applying on every transaction start
+    makes the context hold for the session's whole lifetime.
+
+    The listener takes the connection handed to it by the event and uses
+    that directly, rather than calling back into session.execute() (which
+    would re-enter transaction begin from inside the begin handler).
     """
-    if tenant_id is not None:
-        session.execute(text("SELECT set_config('app.tenant_id', :v, true)"), {"v": tenant_id})
-    if org_unit_id is not None:
-        session.execute(text("SELECT set_config('app.org_unit_id', :v, true)"), {"v": org_unit_id})
+    if tenant_id is None and org_unit_id is None:
+        return
+
+    def _set(connection) -> None:
+        if tenant_id is not None:
+            connection.execute(text("SELECT set_config('app.tenant_id', :v, true)"), {"v": tenant_id})
+        if org_unit_id is not None:
+            connection.execute(text("SELECT set_config('app.org_unit_id', :v, true)"), {"v": org_unit_id})
+
+    @event.listens_for(session, "after_begin")
+    def _reapply_rls_on_new_transaction(sess, transaction, connection) -> None:
+        _set(connection)
 
 
 @contextmanager

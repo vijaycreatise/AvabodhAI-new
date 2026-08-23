@@ -33,6 +33,7 @@ class PageData(BaseModel):
     effective_to:    Optional[datetime] = None
     is_ground_truth: Optional[bool] = None
     preview_link:    Optional[str] = None   # for scraped pages this is just the source URL
+    status:       Optional[str] = None   # NEW 2026-08-21 — UPLOADED | PROCESSING | READY | FAILED
     created_at:   datetime
     updated_at:   Optional[datetime]
     elapsed_sec:  Optional[float]
@@ -83,6 +84,16 @@ class WebScrapeRequest(BaseModel):
         ge=1,
         le=200,
         description="Max pages to crawl. Only relevant when full_site=True.",
+    )
+    caption_images: bool = Field(
+        default=True,
+        description=(
+            "Send images found on the scraped page(s) to GPT-4o Vision. "
+            "Set false for bulk crawls: EACH crawled page is its own document "
+            "and captions up to MAX_IMAGES_PER_DOCUMENT images, so a 30-page "
+            "crawl of an image-heavy site can queue hundreds of billed calls. "
+            "Text, tables and table_html still index normally either way."
+        ),
     )
     same_domain_only: bool = Field(
         default=True,

@@ -1,41 +1,30 @@
 """
 api/routes/search.py
 --------------------
-Semantic + keyword + hybrid search endpoint using pgvector and Postgres
-full-text search together.
+Rewritten 2026-08-21 (Qdrant migration). Same endpoint paths/methods;
+response shapes are additive only (new fields, nothing removed) — see
+IMPLEMENTATION_PLAN (2).md §3.
 
-search_mode controls which of the two underlying search types run:
-  - "hybrid"   (default) — both, merged via Reciprocal Rank Fusion
-  - "semantic" — vector similarity only
-  - "keyword"  — exact keyword match only (chunk_tsvector)
+search_mode still controls "hybrid" (default, dense+sparse fused by
+Qdrant via RRF) / "semantic" (dense only) / "keyword" (sparse only, via
+fastembed SPLADE — replaces the old Postgres chunk_tsvector path).
 
-Role-aware search — a query can be scoped to text chunks only, image
-chunks only, or both (default). Image chunks surface their caption/type
-alongside the usual chunk fields so callers can render them differently
-from text results.
-
-Multi-tenancy + department isolation: both endpoints take tenant_id AND
-org_unit_id from the X-Tenant-ID / X-Org-Unit-ID headers and apply both
-as mandatory filters, together, on EVERY search path (semantic, keyword,
-and hybrid alike) — this is a search endpoint, exactly the kind of query
-that would leak another tenant's, or another department's, document
-content if either filter were ever dropped on any one of the three
-paths. is_ground_truth is always applied too, unconditionally, same as
-every other retrieval path.
+New optional fields: org_ids, document_ids, filters (allowlisted metadata,
+422 on an unknown key), as_of (effective-date filtering), is_ground_truth
+(now an optional filter, not a hard gate), rerank (default True).
 """
 
 import uuid
+from datetime import date
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
-from sqlalchemy.orm import Session
-from sqlalchemy import text
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field, field_validator
 
 from api.dependencies import get_tenant_id, get_org_unit_id
-from db.database import get_db_session_fastapi
-from db.models import DocumentChunk
-from pipeline.retriever import embed_query, vector_search, keyword_search, hybrid_search
+from pipeline.retriever import build_filter, search as retriever_search
+from pipeline import vector_store
 from config.settings import get_settings
 from utils.logger import get_logger
 
@@ -49,16 +38,16 @@ _ALLOWED_MODES = {"hybrid", "semantic", "keyword"}
 
 class SearchRequest(BaseModel):
     query:    str = Field(min_length=1, description="Search query")
-    top_k:    int = Field(default=5, ge=1, le=20, description="Number of results")
-    doc_name: Optional[str] = Field(default=None, description="Filter by document name (optional)")
-    role:     Optional[str] = Field(
-        default=None,
-        description="Filter by chunk role: 'text' or 'image'. Omit to search both.",
-    )
-    search_mode: str = Field(
-        default="hybrid",
-        description="'hybrid' (semantic + keyword, merged via RRF), 'semantic' (vector only), or 'keyword' (exact match only, via Postgres full-text search).",
-    )
+    top_k:    int = Field(default=5, ge=1, le=50, description="Number of results")
+    doc_name: Optional[str] = Field(default=None)
+    role:     Optional[str] = Field(default=None, description="'text' or 'image'. Omit to search both.")
+    search_mode: str = Field(default="hybrid", description="'hybrid', 'semantic', or 'keyword'.")
+    org_ids: Optional[list[str]] = Field(default=None, description="Widen search to multiple departments within your tenant. Defaults to the caller's own org unit.")
+    document_ids: Optional[list[uuid.UUID]] = Field(default=None)
+    filters: Optional[dict[str, list[str]]] = Field(default=None, description="Allowlisted metadata filters, e.g. {\"country\": [\"IN\"]}")
+    as_of: Optional[date] = Field(default=None, description="Effective-date filter — only documents valid on this date")
+    is_ground_truth: Optional[bool] = Field(default=None, description="Optional filter — omit to search all documents")
+    rerank: bool = Field(default=True)
 
     @field_validator("role")
     @classmethod
@@ -86,15 +75,28 @@ class ChunkResult(BaseModel):
     chunk_text:  str
     chunk_size:  int
     page_number: Optional[int] = None
+    doc_hash:    Optional[str] = None
     similarity:  float
-    search_type: Optional[str] = None          # NEW — 'semantic' or 'keyword', which engine found this result
-    matched_by:  Optional[list[str]] = None    # NEW — hybrid mode only: which engine(s) found it. Both = strongest signal.
+    search_type: Optional[str] = None
+    matched_by:  Optional[list[str]] = None
     role:            str = "text"
     image_type:      Optional[str] = None
     image_caption:   Optional[str] = None
+    image_url:       Optional[str] = None
     section_heading: Optional[str] = None
     topic:           Optional[str] = None
     chunk_type:      Optional[str] = None
+    table_html:      Optional[str] = None   # original <table> markup, when this chunk contains a table
+    # NEW 2026-08-21
+    document_id:   Optional[str] = None
+    chunk_id:      Optional[str] = None
+    chunk_number:  Optional[int] = None
+    score:         Optional[float] = None
+    rerank_score:  Optional[float] = None
+    org_unit_id:   Optional[str] = None
+    effective_from: Optional[str] = None
+    effective_to:   Optional[str] = None
+    metadata:      Optional[dict] = None
 
 
 class SearchResponse(BaseModel):
@@ -104,59 +106,59 @@ class SearchResponse(BaseModel):
     total:       int
 
 
+def _result_to_chunk(r: dict) -> ChunkResult:
+    return ChunkResult(
+        id=r["id"], doc_name=r.get("doc_name", ""), chunk_index=r.get("chunk_index", 0),
+        chunk_text=r.get("chunk_text", ""), chunk_size=r.get("chunk_size", 0), page_number=r.get("page_number"),
+        doc_hash=r.get("doc_hash"), similarity=r.get("similarity", 0.0),
+        search_type=r.get("search_type"), matched_by=r.get("matched_by"),
+        role=r.get("role") or "text", image_type=r.get("image_type"), image_caption=r.get("image_caption"),
+        image_url=r.get("image_url"), section_heading=r.get("section_heading"), topic=r.get("topic"),
+        chunk_type=r.get("chunk_type"), table_html=r.get("table_html"),
+        document_id=r.get("document_id"), chunk_id=r.get("chunk_id", r.get("id")),
+        chunk_number=r.get("chunk_index"), score=r.get("score"), rerank_score=r.get("rerank_score"),
+        org_unit_id=r.get("org_unit_id"), effective_from=r.get("effective_from"), effective_to=r.get("effective_to"),
+        metadata={k[5:]: v for k, v in r.items() if k.startswith("meta_")} or None,
+    )
+
+
 @router.post("/", response_model=SearchResponse, summary="Semantic, keyword, or hybrid search across documents")
 async def semantic_search(
     payload: SearchRequest,
     tenant_id: str = Depends(get_tenant_id),
     org_unit_id: str = Depends(get_org_unit_id),
-    db: Session = Depends(get_db_session_fastapi),
 ):
-    """
-    Find most relevant chunks for a query. Defaults to hybrid (semantic +
-    keyword, merged via Reciprocal Rank Fusion) — pass search_mode to
-    narrow to just one engine. By default searches BOTH text and image
-    chunks — pass role='text' or role='image' to scope to just one kind.
-    Always scoped to the caller's tenant_id + org_unit_id, and always
-    ground-truth-only.
-    """
     try:
-        common = dict(
-            db=db, tenant_id=tenant_id, org_unit_id=org_unit_id,
-            top_k=payload.top_k, doc_filter=payload.doc_name, role_filter=payload.role,
+        query_filter = build_filter(
+            tenant_id=tenant_id, org_unit_id=org_unit_id, org_ids=payload.org_ids,
+            document_ids=[str(d) for d in payload.document_ids] if payload.document_ids else None,
+            doc_name=payload.doc_name, role=payload.role, is_ground_truth=payload.is_ground_truth,
+            metadata=payload.filters, as_of=payload.as_of,
         )
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
 
-        if payload.search_mode == "semantic":
-            query_vector = embed_query(payload.query)
-            results = vector_search(query_vector=query_vector, **common)
-        elif payload.search_mode == "keyword":
-            results = keyword_search(query_text=payload.query, **common)
-        else:  # hybrid
-            results = hybrid_search(query_text=payload.query, **common)
-
+    try:
+        # run_in_threadpool: same event-loop-freezing issue as
+        # api/routes/chat.py (this repo runs uvicorn --workers 1) —
+        # embedding + Qdrant + cross-encoder reranking are all blocking
+        # calls; called directly here they'd stall the whole API, not
+        # just this request, for the ~10-15s a rerank pass takes.
+        results = await run_in_threadpool(
+            retriever_search,
+            query=payload.query, query_filter=query_filter, mode=payload.search_mode,
+            top_k=payload.top_k, do_rerank=payload.rerank,
+        )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+        # Phase H #6 — log full detail server-side, generic message to
+        # the caller. Correlate via the X-Request-ID response header
+        # (api/middleware/logging_middleware.py) and this log line.
+        logger.exception("Search failed (query=%r, mode=%s): %s", payload.query, payload.search_mode, e)
+        raise HTTPException(status_code=500, detail="Search failed. Contact support with the X-Request-ID response header if this persists.")
 
     return SearchResponse(
-        query=payload.query,
-        search_mode=payload.search_mode,
-        results=[
-            ChunkResult(
-                id=r["id"], doc_name=r["doc_name"],
-                chunk_index=r["chunk_index"], chunk_text=r["chunk_text"],
-                chunk_size=r["chunk_size"], page_number=r["page_number"],
-                similarity=r["similarity"],
-                search_type=r.get("search_type"),
-                matched_by=r.get("matched_by"),
-                role=r.get("role") or "text",
-                image_type=r.get("image_type"),
-                image_caption=r.get("image_caption"),
-                section_heading=r.get("section_heading"),
-                topic=r.get("topic"),
-                chunk_type=r.get("chunk_type"),
-            )
-            for r in results
-        ],
-        total=len(results),
+        query=payload.query, search_mode=payload.search_mode,
+        results=[_result_to_chunk(r) for r in results], total=len(results),
     )
 
 
@@ -166,63 +168,42 @@ async def get_document_chunks(
     role: Optional[str] = None,
     tenant_id: str = Depends(get_tenant_id),
     org_unit_id: str = Depends(get_org_unit_id),
-    db: Session = Depends(get_db_session_fastapi),
 ):
     """
-    Get all stored chunks and metadata for a document, scoped to
-    tenant_id + org_unit_id. Pass role='text' or role='image' to filter
-    to just one kind — the response always reports both text_chunks and
-    image_chunks counts regardless of the filter, so callers can see the
-    full breakdown. NOT filtered by is_ground_truth — this is a document-
-    management view of a document you already own, not a retrieval path,
-    so it deliberately shows all chunks including non-ground-truth ones.
+    2026-08-21: now served from Qdrant (vector_store.scroll_document_chunks)
+    instead of the old document_chunks Postgres table (gone). Same response
+    shape minus `has_tsvector` (no FTS column exists any more).
     """
     if role is not None:
         role = role.strip().lower()
         if role not in _ALLOWED_ROLES:
             raise HTTPException(status_code=422, detail=f"role must be one of {sorted(_ALLOWED_ROLES)}")
 
-    base_query = db.query(DocumentChunk).filter(
-        DocumentChunk.summary_id == doc_id,
-        DocumentChunk.tenant_id == tenant_id,
-        DocumentChunk.org_unit_id == org_unit_id,
-    )
-
-    text_count = base_query.filter(DocumentChunk.role == "text").count()
-    image_count = base_query.filter(DocumentChunk.role == "image").count()
-
-    query = base_query
-    if role:
-        query = query.filter(DocumentChunk.role == role)
-
-    chunks = query.order_by(DocumentChunk.chunk_index).all()
-
-    if not chunks and text_count == 0 and image_count == 0:
+    all_chunks = vector_store.scroll_document_chunks(tenant_id=tenant_id, org_unit_id=org_unit_id, document_id=str(doc_id))
+    if not all_chunks:
         raise HTTPException(status_code=404, detail=f"No chunks found for ID '{doc_id}'")
+
+    text_count = sum(1 for c in all_chunks if c.get("role", "text") == "text")
+    image_count = sum(1 for c in all_chunks if c.get("role") == "image")
+    chunks = [c for c in all_chunks if role is None or c.get("role") == role]
 
     return {
         "doc_id": str(doc_id),
-        "doc_name": chunks[0].doc_name if chunks else None,
+        "doc_name": all_chunks[0].get("doc_name"),
         "total_chunks": len(chunks),
         "text_chunks": text_count,
         "image_chunks": image_count,
         "chunks": [
             {
-                "id": str(c.id), "chunk_index": c.chunk_index,
-                "chunk_text": c.chunk_text, "chunk_size": c.chunk_size,
-                "page_number": c.page_number, "model": c.embedding_model,
-                "role": c.role or "text",
-                "image_type": c.image_type,
-                "image_caption": c.image_caption,
-                "contains_chart": c.contains_chart,
-                "contains_table": c.contains_table,
-                "vision_confidence": c.vision_confidence,
-                "is_ground_truth": c.is_ground_truth,
-                "has_tsvector": c.chunk_tsvector is not None,
-                "section_heading": c.section_heading,
-                "topic": c.topic,
-                "chunk_type": c.chunk_type,
-                "created_at": str(c.created_at),
+                "id": c["id"], "chunk_index": c.get("chunk_index"), "chunk_text": c.get("chunk_text"),
+                "chunk_size": c.get("chunk_size"), "page_number": c.get("page_number"),
+                "model": c.get("embedding_model"), "role": c.get("role") or "text",
+                "image_type": c.get("image_type"), "image_caption": c.get("image_caption"),
+                "contains_chart": c.get("contains_chart"), "contains_table": c.get("contains_table"),
+                "vision_confidence": c.get("vision_confidence"), "is_ground_truth": c.get("is_ground_truth"),
+                "section_heading": c.get("section_heading"), "topic": c.get("topic"), "chunk_type": c.get("chunk_type"),
+                "table_html": c.get("table_html"),
+                "created_at": c.get("created_at"),
             }
             for c in chunks
         ]
