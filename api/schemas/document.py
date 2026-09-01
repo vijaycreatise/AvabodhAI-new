@@ -45,6 +45,10 @@ class DocumentUploadResponse(BaseModel):
     metadata_status:         Optional[str] = None
     image_count:             Optional[int] = 0
     preview_link:            Optional[str] = None   # NEW — signed file link or source URL
+    # NEW 2026-08-21 (Qdrant migration) — background ingestion lifecycle.
+    status:        Optional[str] = None   # UPLOADED | PROCESSING | READY | FAILED
+    status_detail: Optional[str] = None   # error detail when status=FAILED
+    metadata:      Optional[dict] = None  # client-supplied metadata (full payload)
     created_at:   datetime
     updated_at:   Optional[datetime] = None
     elapsed_sec:  Optional[float] = None
@@ -64,6 +68,7 @@ class DocumentListItem(BaseModel):
     category:      Optional[str] = None    # NEW
     is_ground_truth: Optional[bool] = None  # NEW
     image_count:   Optional[int] = 0
+    status:        Optional[str] = None    # NEW 2026-08-21
     created_at:  datetime
     summary_preview: Optional[str] = None
 
@@ -114,6 +119,9 @@ class DocumentDetailResponse(BaseModel):
     metadata_status:         Optional[str] = None
     image_count:             Optional[int] = 0
     preview_link:            Optional[str] = None
+    status:        Optional[str] = None   # NEW 2026-08-21
+    status_detail: Optional[str] = None   # NEW 2026-08-21
+    metadata:      Optional[dict] = None  # NEW 2026-08-21
     created_at:   datetime
     updated_at:   Optional[datetime] = None
 
@@ -138,6 +146,11 @@ class DocumentUpdateResponse(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class ReprocessResponse(BaseModel):
+    id:     UUID
+    status: str = "PROCESSING"
 
 
 class DeleteResponse(BaseModel):

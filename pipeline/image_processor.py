@@ -63,7 +63,15 @@ class ImageCaptionOutput(BaseModel):
     not from alt text or filename.
     """
     caption:          str        = Field(description="Detailed description of what the image shows")
-    image_type:       str        = Field(description="chart|table|diagram|photo|screenshot|infographic|other")
+    # 2026-08-22: bounded to exactly these three (image-side) — chunk type
+    # overall is bounded to {text, table, chart, diagram}, "text" being
+    # role="text" chunks, which never carry image_type at all. photo/
+    # screenshot/infographic/other were dropped: this app's real documents
+    # (financial/real-estate PDFs) don't produce genuine object photos —
+    # every image encountered is one of these three. Any value Vision
+    # returns outside this set falls back to "diagram" (the most general
+    # of the three, not a distinct "unknown" bucket like "other" was).
+    image_type:       str        = Field(description="chart|table|diagram")
     contains_chart:   bool       = Field(default=False)
     contains_table:   bool       = Field(default=False)
     contains_text:    bool       = Field(default=False, description="True if image has embedded text (infographic etc)")
@@ -74,9 +82,20 @@ class ImageCaptionOutput(BaseModel):
     @field_validator("image_type", mode="before")
     @classmethod
     def validate_type(cls, v: str) -> str:
-        allowed = {"chart", "table", "diagram", "photo", "screenshot", "infographic", "other"}
-        v = str(v).strip().lower()
-        return v if v in allowed else "other"
+        # "NA" is distinct from {chart, table, diagram} — reserved for
+        # _fallback_caption_from_alt_text(), where no actual Vision
+        # classification happened at all (bare alt text only), so forcing
+        # it into one of the three real categories would misrepresent it
+        # as a real classification. Vision's own output must always be one
+        # of the three; only this fallback path is allowed to say "NA".
+        allowed = {"chart", "table", "diagram", "NA"}
+        v = str(v).strip()
+        v_lower = v.lower()
+        if v_lower in {"chart", "table", "diagram"}:
+            return v_lower
+        if v == "NA":
+            return v
+        return "diagram"
 
     @field_validator("caption", "suggested_alt_text", mode="before")
     @classmethod
@@ -123,6 +142,33 @@ def compute_image_hash(image_bytes: bytes) -> str:
     return hashlib.sha256(image_bytes).hexdigest()
 
 
+def table_html_is_reliable(table_html: Optional[str]) -> bool:
+    """
+    Heuristic: is this table's structure-inference HTML (unstructured's
+    infer_table_structure=True, el.metadata.text_as_html) trustworthy
+    enough that captioning the table visually via GPT-4o Vision would be
+    redundant AND lossy — Vision necessarily compresses a table into a
+    prose caption ("key elements"), which can misread or drop values a
+    clean structured extraction already has exactly right.
+
+    Used by pipeline/ingest.py to skip the Vision-crop-caption call for
+    tables that already extracted cleanly, and only fall back to it for
+    tables where the structured extraction came out missing or clearly
+    broken — the same garbled-table failure mode found live in testing
+    (a multi-column PDF layout bleeding unrelated text into a table).
+
+    Deliberately simple/conservative — false negatives (sending a
+    perfectly fine table to Vision anyway) just cost an extra API call;
+    false positives (skipping Vision for a genuinely broken table) lose
+    real accuracy, so the bar for "reliable" is kept low on purpose.
+    """
+    if not table_html or len(table_html.strip()) < 40:
+        return False
+    if table_html.count("<tr") < 2:   # need at least a header + one data row
+        return False
+    return True
+
+
 # ── Image preparation ────────────────────────────────────────────────────────
 
 def prepare_image_for_vision(image_bytes: bytes) -> tuple[str, str, int, int, str]:
@@ -155,26 +201,28 @@ def prepare_image_for_vision(image_bytes: bytes) -> tuple[str, str, int, int, st
 
 # ── GPT-4o Vision call ───────────────────────────────────────────────────────
 
-_VISION_PROMPT = """Analyze this image carefully and respond with a JSON object.
+# 2026-08-22: simplified — this used to also carry the detailed per-type
+# reading guidance ("if chart: describe axes...", "Read chart axes and
+# approximate values...", etc). That guidance now lives in
+# pipeline/memory.py's system prompt (rule 7a) instead, governing how the
+# FINAL answer LLM extracts/uses a caption's data — captioning itself only
+# needs to produce a comprehensive, structured description; how precisely
+# that description gets mined for an answer is a downstream concern, not
+# an ingestion-time one.
+_VISION_PROMPT = """Generate a comprehensive, searchable description abiding the instructions below only if its a image. Otherwise if it feels like a table, please recosturct it in a llm understandable structure keeping in mind it can also be used to perfrom mathametical operations.
 
-You must return ONLY valid JSON with these exact fields:
+
+Return ONLY valid JSON with these exact fields:
 {
-  "caption": "<detailed description — if chart: describe axes, values, trends; if table: describe columns and key data; if diagram: describe components and flow; if photo: describe scene and objects>",
-  "image_type": "<one of: chart, table, diagram, photo, screenshot, infographic, other>",
+  "caption": "<detailed description of what the image shows>",
+  "image_type": "<one of: chart, table, diagram>",
   "contains_chart": <true or false>,
   "contains_table": <true or false>,
   "contains_text": <true if image contains readable embedded text>,
   "key_elements": ["<element1>", "<element2>", ...],
   "suggested_alt_text": "<max 125 chars accessible description>",
   "confidence": <0.0 to 1.0 — your confidence in this analysis>
-}
-
-Important:
-- Read chart axes and approximate values if visible
-- Transcribe any text embedded in the image
-- For diagrams, describe the relationships and flow
-- key_elements should be specific (e.g. "Y-axis: Revenue in millions", "Q4 bar reaching 85")
-- Be precise and factual, not generic"""
+}"""
 
 
 def _fallback_caption_from_alt_text(alt_text: str) -> Optional[ImageCaptionOutput]:
@@ -190,7 +238,7 @@ def _fallback_caption_from_alt_text(alt_text: str) -> Optional[ImageCaptionOutpu
     try:
         return ImageCaptionOutput(
             caption=alt_text,
-            image_type="other",
+            image_type="NA",   # no real Vision classification happened here — bare alt text only, see ImageCaptionOutput.validate_type
             contains_chart=False,
             contains_table=False,
             contains_text=False,
@@ -206,13 +254,41 @@ def caption_image_with_vision(
     image_bytes:    bytes,
     surrounding_text: str = "",
     alt_text:       str = "",
+    force:          bool = False,
+    model:          Optional[str] = None,
 ) -> Optional[ImageCaptionOutput]:
     """
     Call GPT-4o Vision and return structured ImageCaptionOutput.
     If the Vision call fails and alt_text is available, falls back to a
     low-confidence caption built from alt_text instead of dropping the
     image entirely. Returns None only if there's nothing usable at all.
+
+    force: bypass the settings.VISION_ENABLED kill switch. Only the chat
+    path where a USER attaches an image to their question passes this —
+    that isn't document ingestion, and the toggle exists to control
+    ingestion spend, not to disable a live feature mid-conversation.
+    Every ingestion call site (PDF image regions, fallback table crops,
+    standalone image uploads, scraped web images) leaves it False.
+
+    model: override the captioning model for this one call. Defaults to
+    settings.VISION_MODEL (gpt-4o), which is what every INGESTION call
+    site uses. The chat path — a user attaching an image to their own
+    question — passes settings.MAP_MODEL instead, so live chat traffic
+    stays on the cheap model while document ingestion keeps the stronger
+    reader.
     """
+    if not force and not settings.VISION_ENABLED:
+        # Same return path a genuine API failure takes, on purpose: the
+        # alt-text fallback and the "no alt text -> None -> caller skips
+        # this image" behavior are already the tested, understood shape of
+        # "no caption available". Reusing it means the switch introduces no
+        # new downstream branch to reason about.
+        logger.info(
+            "VISION_ENABLED=false — skipping GPT-4o Vision captioning (%s)",
+            "using alt text instead" if (alt_text or "").strip() else "no alt text, image will be dropped",
+        )
+        return _fallback_caption_from_alt_text(alt_text)
+
     try:
         b64, fmt, width, height, media_type = prepare_image_for_vision(image_bytes)
     except Exception as e:
@@ -229,7 +305,7 @@ def caption_image_with_vision(
     try:
         client = OpenAI(api_key=settings.OPENAI_API_KEY)
         response = client.chat.completions.create(
-            model=VISION_MODEL,
+            model=model or VISION_MODEL,
             max_tokens=800,
             temperature=0.0,
             response_format={"type": "json_object"},
@@ -356,7 +432,15 @@ def extract_images_from_soup(
     image_index = 0
 
     img_tags = soup.find_all("img")
-    logger.info("Found %d <img> tags in '%s'", len(img_tags), doc_name)
+    _cap = getattr(settings, "MAX_IMAGES_PER_DOCUMENT", 20) or 20
+    if len(img_tags) > _cap:
+        logger.warning(
+            "'%s' has %d <img> tags - capping Vision captioning at %d "
+            "(MAX_IMAGES_PER_DOCUMENT). The rest are skipped; text and tables are unaffected.",
+            doc_name, len(img_tags), _cap,
+        )
+        img_tags = img_tags[:_cap]
+    logger.info("Processing %d <img> tag(s) in '%s'", len(img_tags), doc_name)
 
     for img_tag in img_tags:
         try:
@@ -430,7 +514,7 @@ def extract_images_from_soup(
             if caption is None:
                 continue
 
-            if caption.image_type == "other" and caption.confidence < 0.5:
+            if caption.image_type == "NA" and caption.confidence < 0.5:
                 continue
 
             embedding_text = build_image_embedding_text(
@@ -482,6 +566,208 @@ def extract_images_from_soup(
         r["total_chunks"] = total
 
     logger.info("Extracted %d web images from '%s'", total, doc_name)
+    return results
+
+
+# ── Extract images from a PDF (upload mode) ────────────────────────────────
+
+def extract_images_from_elements(
+    all_elements: list,
+    image_elements: list,
+    doc_name: str,
+    source_path: str = "",
+    hash_exists_fn=None,
+    save_crops_dir: Optional[str] = None,
+) -> list[dict]:
+    """
+    Extract, caption, and prepare images found by unstructured's own
+    hi_res layout detection (pipeline/extractor.py::_partition_pdf,
+    extract_image_block_types=["Image"], extract_image_block_to_payload=True)
+    — replaces the earlier PyMuPDF-based extract_images_from_pdf()
+    (2026-08-21). Returns the same plain-dict shape that function did.
+
+    Why the switch: hi_res layout detection runs on the RENDERED page, so
+    it also catches vector-drawn charts/figures that are just shapes+text
+    on the page, not an embedded raster object at all. The PyMuPDF
+    approach (page.get_images(), an XObject-table lookup) silently missed
+    those entirely — confirmed against a real chart-heavy document, not
+    a hypothetical gap.
+
+    all_elements: the FULL originally-partitioned element list (before
+    extractor.py splits out the image elements) — used to build each
+    image's surrounding-text context from same-page text elements, the
+    same role page.get_text() played in the old PyMuPDF version.
+    image_elements: just the "Image"-category elements to process.
+
+    hash_exists_fn: optional callable(image_bytes_hash) -> bool, same
+    pattern as extract_images_from_soup() — pass a Qdrant-backed dedup
+    check from the caller (pipeline/ingest.py) to skip the Vision API call
+    for images already indexed (e.g. a repeated letterhead/watermark).
+
+    save_crops_dir: when set, each element's crop is ALSO written to disk
+    (under save_crops_dir/{content hash}.{fmt}) and the resulting path is
+    added to the result dict as "crop_image_path".
+
+    2026-08-23 — BOTH of pipeline/ingest.py's call sites now pass this
+    (charts/diagrams as well as fallback table crops); it used to be the
+    table-fallback site only, on the theory that a plain image's caption
+    was its primary signal with no higher-fidelity alternative to fall
+    back to. That theory was wrong in practice: the caption is written
+    HERE, at ingestion, before any question exists — so a chart's axis
+    values, legend entries and labels get compressed into prose and are
+    simply gone by the time an answer needs an exact figure. The crop IS
+    the higher-fidelity alternative, and api/routes/chat.py re-attaches it
+    to the final LLM call so the answering model reads the pixels itself.
+    The caption still earns its keep as the EMBEDDED text (retrieval has
+    to match on something searchable); it just stops being the only thing
+    the answering model ever sees.
+    """
+    import base64
+    import io as _io
+
+    results: list[dict] = []
+    image_index = 0
+    # Scoped across the WHOLE document — some PDFs (e.g. a repeated
+    # infographic/template design) show the exact same image on every
+    # page. Confirmed necessary against a real document during testing:
+    # without this, the same ~12 images came through 4x (once per page),
+    # badly skewing retrieval toward whichever caption repeated most.
+    seen_hashes = set()
+
+    # Per-page text context, built from the non-image elements — same
+    # role page.get_text() played for the old PyMuPDF version.
+    page_text_parts: dict[int, list[str]] = {}
+    for el in all_elements:
+        pg = getattr(el.metadata, "page_number", None)
+        if pg is None:
+            continue
+        page_text_parts.setdefault(pg, []).append(str(el))
+    page_text = {pg: "\n".join(parts) for pg, parts in page_text_parts.items()}
+
+    _cap = getattr(settings, "MAX_IMAGES_PER_DOCUMENT", 20) or 20
+    if len(image_elements) > _cap:
+        logger.warning(
+            "'%s' has %d image regions - capping Vision captioning at %d "
+            "(MAX_IMAGES_PER_DOCUMENT). The rest are skipped; text and tables are unaffected.",
+            doc_name, len(image_elements), _cap,
+        )
+        image_elements = image_elements[:_cap]
+    logger.info("Processing %d image region(s) found in '%s'", len(image_elements), doc_name)
+
+    for el in image_elements:
+        try:
+            b64 = getattr(el.metadata, "image_base64", None)
+            if not b64:
+                continue
+            image_bytes = base64.b64decode(b64)
+            mime = getattr(el.metadata, "image_mime_type", None) or "image/jpeg"
+            image_format = mime.split("/")[-1] if "/" in mime else "jpeg"
+            page_num = getattr(el.metadata, "page_number", None)
+            context_text = page_text.get(page_num, "")
+
+            try:
+                from PIL import Image as PILImage
+                pil_img = PILImage.open(_io.BytesIO(image_bytes))
+                width, height = pil_img.size
+            except Exception:
+                width, height = 0, 0
+            size = len(image_bytes)
+
+            skip, reason = should_skip_image(
+                image_bytes=image_bytes, width=width, height=height,
+                image_format=image_format,
+            )
+            if skip:
+                logger.debug("Skipping image region page=%s: %s", page_num, reason)
+                continue
+
+            img_hash = compute_image_hash(image_bytes)
+            if img_hash in seen_hashes:
+                logger.debug(
+                    "Skipping duplicate image within this document (page %s, hash=%s)",
+                    page_num, img_hash[:12],
+                )
+                continue
+            seen_hashes.add(img_hash)
+
+            if hash_exists_fn is not None:
+                try:
+                    if hash_exists_fn(img_hash):
+                        logger.debug(
+                            "Skipping already-embedded image on page %s (hash=%s)",
+                            page_num, img_hash[:12],
+                        )
+                        continue
+                except Exception as e:
+                    logger.debug("Dedup check failed, continuing anyway: %s", e)
+
+            caption = caption_image_with_vision(
+                image_bytes=image_bytes, surrounding_text=context_text[:800],
+            )
+            if caption is None:
+                logger.warning("Vision captioning failed for image region on page %s", page_num)
+                continue
+            if caption.image_type == "NA" and caption.confidence < 0.5:
+                logger.debug("Skipping low-confidence image on page %s", page_num)
+                continue
+
+            embedding_text = build_image_embedding_text(
+                caption=caption, doc_name=doc_name, surrounding_text=context_text[:400],
+            )
+
+            crop_image_path = None
+            if save_crops_dir:
+                try:
+                    import os
+                    os.makedirs(save_crops_dir, exist_ok=True)
+                    crop_image_path = os.path.join(save_crops_dir, f"{img_hash}.{image_format}")
+                    if not os.path.exists(crop_image_path):   # content-hash filename — already-saved crop needs no rewrite
+                        with open(crop_image_path, "wb") as f:
+                            f.write(image_bytes)
+                except Exception as e:
+                    logger.warning("Failed to save table crop to disk (non-fatal, caption still used): %s", e)
+                    crop_image_path = None
+
+            results.append({
+                "doc_name": doc_name,
+                "source_path": source_path,
+                "page_number": page_num,
+                "image_bytes_hash": img_hash,
+                "image_url": None,   # PDF-embedded, no URL
+                "image_format": image_format,
+                "image_width": width,
+                "image_height": height,
+                "image_size_bytes": size,
+                "image_caption": caption.caption,
+                "image_type": caption.image_type,
+                "image_alt_text": caption.suggested_alt_text,
+                "image_context": context_text[:500],
+                "contains_chart": caption.contains_chart,
+                "contains_table": caption.contains_table,
+                "contains_text_img": caption.contains_text,
+                "key_elements": caption.key_elements,
+                "vision_model_used": "gpt-4o",
+                "vision_confidence": caption.confidence,
+                "embedding_text": embedding_text,
+                "crop_image_path": crop_image_path,
+                "chunk_index": image_index,
+                "total_chunks": 1,
+            })
+            image_index += 1
+            logger.info(
+                "Image %d captured: page=%s type=%s confidence=%.2f",
+                image_index, page_num, caption.image_type, caption.confidence,
+            )
+        except Exception as e:
+            logger.warning("Failed to process image region on page %s: %s", getattr(el.metadata, "page_number", "?"), e)
+            continue
+
+    total = len(results)
+    for i, r in enumerate(results):
+        r["chunk_index"] = i
+        r["total_chunks"] = total
+
+    logger.info("Extracted %d image(s) from '%s'", total, doc_name)
     return results
 
 

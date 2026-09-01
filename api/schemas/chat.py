@@ -93,6 +93,9 @@ class SourceReference(BaseModel):
     role:        Optional[str]  = "text"   # NEW — "text" or "image"
     image_type:  Optional[str]  = None     # NEW — chart/diagram/photo etc (image chunks only)
     image_url:   Optional[str]  = None     # NEW — original image URL (image chunks only)
+    page_number:     Optional[int] = None   # NEW 2026-08-21 — which page this chunk came from
+    section_heading: Optional[str] = None   # NEW 2026-08-21 — which document section this chunk came from
+    table_html:      Optional[str] = None   # NEW 2026-08-21 — original <table> markup, when this source is a table
 
 
 class ChatMessageResponse(BaseModel):

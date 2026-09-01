@@ -50,6 +50,28 @@ RUN pip install --no-cache-dir --upgrade pip && \
 # means it's always present, with zero network dependency at runtime.
 RUN python -m nltk.downloader -d /usr/local/share/nltk_data punkt_tab punkt
 
+# ── Pre-download fastembed models (SPLADE sparse + cross-encoder reranker) ─────
+# Same rationale as the NLTK download above — ~100MB combined, one-time,
+# baked into the image so the first real request doesn't pay this cost
+# (or fail outright on a restricted-egress network) mid-request.
+RUN python -c "from fastembed import SparseTextEmbedding; \
+    from fastembed.rerank.cross_encoder import TextCrossEncoder; \
+    SparseTextEmbedding(model_name='prithivida/Splade_PP_en_v1'); \
+    TextCrossEncoder(model_name='BAAI/bge-reranker-base')"
+
+# NOTE: the two model names above MUST match config/settings.py's
+# SPARSE_MODEL / RERANK_MODEL. They drifted once already (this baked in
+# bge-reranker-v2-m3 while the app used bge-reranker-base), so the baked-in
+# model was never touched and the real one downloaded mid-request instead.
+
+# -- Pre-download the PDF layout + table-structure models --------------------
+# unstructured's hi_res strategy loads a YOLOX layout model and a table
+# transformer on FIRST USE. Left to runtime that is a multi-hundred-MB
+# download landing inside whichever upload happens to be first after a
+# deploy. Baked in here; main.py additionally warms them into memory at boot.
+RUN python -c "from unstructured_inference.models.base import get_model; get_model()"
+RUN python -c "from unstructured_inference.models.tables import load_agent; load_agent()"
+
 # ── Install Playwright browser ────────────────────────────────────────────────
 RUN playwright install-deps chromium
 RUN playwright install chromium

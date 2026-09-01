@@ -25,9 +25,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 
+from config.settings import get_settings
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
+settings = get_settings()
 
 # Paths that are legitimately tenant-agnostic — ops/monitoring endpoints
 # and the API's own docs. Everything else must carry both headers.
@@ -84,4 +86,18 @@ class TenantGuardMiddleware(BaseHTTPMiddleware):
                     status_code=400,
                     content={"detail": f"{' and '.join(missing)} header is required"},
                 )
+
+            # Phase H #4 — optional service-to-service auth. Empty by
+            # default (settings.SERVICE_API_KEY == "") means behavior is
+            # IDENTICAL to before this existed: headers are trusted as-is,
+            # exactly what clariona-core's current calls already do. Only
+            # once an operator explicitly sets SERVICE_API_KEY does this
+            # additionally require a matching X-Service-Key header —
+            # opt-in, never breaks an existing caller that hasn't adopted it.
+            if settings.SERVICE_API_KEY:
+                provided = request.headers.get("x-service-key", "")
+                if provided != settings.SERVICE_API_KEY:
+                    logger.warning("Rejected request with missing/invalid X-Service-Key: %s %s", request.method, path)
+                    return JSONResponse(status_code=401, content={"detail": "X-Service-Key header is required"})
+
         return await call_next(request)

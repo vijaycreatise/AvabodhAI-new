@@ -1,22 +1,10 @@
 services:
-  db:
-    image: pgvector/pgvector:pg16
-    container_name: avabodh_db
-    restart: always
-    environment:
-      POSTGRES_DB:       ${DB_NAME:-avabodh}
-      POSTGRES_USER:     ${DB_USER:-postgres}
-      POSTGRES_PASSWORD: ${DB_PASSWORD}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres}"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-
+  # Postgres is deliberately NOT a service here — it (and any vector DB)
+  # must be a permanent instance living on its own local/host storage,
+  # not something docker-compose creates and owns the lifecycle of. Point
+  # DB_HOST/DB_PORT below at wherever that instance actually runs (a local
+  # install, a managed instance, etc.), then provision it once with:
+  #     python scripts/init_schema.py
   api:
     build: .
     image: apurbapm/avabodhai-api:latest
@@ -33,10 +21,17 @@ services:
       OLLAMA_EMBEDDING_MODEL: ${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}
       OLLAMA_EMBEDDING_DIMENSIONS: ${OLLAMA_EMBEDDING_DIMENSIONS:-768}
       MAP_MODEL:            ${MAP_MODEL:-gpt-4o-mini}
+      CHAT_MODEL:           ${CHAT_MODEL:-gpt-4o-mini}
+      CHAT_TEMPERATURE:     ${CHAT_TEMPERATURE:-0.1}
       REDUCE_MODEL:         ${REDUCE_MODEL:-gpt-4o-mini}
       EMBEDDING_MODEL:      ${EMBEDDING_MODEL:-text-embedding-3-small}
-      DB_HOST:              db
-      DB_PORT:              5432
+      # Points at your externally-managed Postgres instance — see the note
+      # above the `api` service. Not localhost: from inside this container,
+      # localhost is the container itself. Use the host's actual reachable
+      # address (host.docker.internal on Docker Desktop, a LAN/VPC address,
+      # or a managed instance's hostname).
+      DB_HOST:              ${DB_HOST:?set DB_HOST to your Postgres instance's address}
+      DB_PORT:              ${DB_PORT:-5432}
       DB_NAME:              ${DB_NAME:-avabodh}
       DB_USER:              ${DB_USER:-postgres}
       DB_PASSWORD:          ${DB_PASSWORD}
@@ -49,22 +44,71 @@ services:
       # CHANGE APP_DB_PASSWORD before any real deployment.
       APP_DB_USER:          ${APP_DB_USER:-avabodh_app}
       APP_DB_PASSWORD:      ${APP_DB_PASSWORD:-CHANGE-ME-app-role-password}
-      FTS_LANGUAGE:         ${FTS_LANGUAGE:-english}
-      HYBRID_RRF_K:         ${HYBRID_RRF_K:-60}
+      # Qdrant — same rule as Postgres above: externally-managed, not a
+      # compose service, never shared with clariona-core's own instance.
+      # Provision with: python scripts/init_qdrant.py
+      QDRANT_URL:           ${QDRANT_URL:?set QDRANT_URL to your Qdrant instance's address}
+      QDRANT_API_KEY:       ${QDRANT_API_KEY:-}
+      QDRANT_COLLECTION:        ${QDRANT_COLLECTION:-avabodh_chunks}
+      QDRANT_CHAT_COLLECTION:   ${QDRANT_CHAT_COLLECTION:-avabodh_chat_messages}
+      SPARSE_MODEL:         ${SPARSE_MODEL:-prithivida/Splade_PP_en_v1}
+      RERANK_MODEL:         ${RERANK_MODEL:-BAAI/bge-reranker-base}
+      SEARCH_CANDIDATES:    ${SEARCH_CANDIDATES:-50}
+      SEARCH_CANDIDATES_MAX: ${SEARCH_CANDIDATES_MAX:-80}
+      # Retrieval relevance floor. Was NOT passed through, so a container
+      # ignored whatever .env had tuned and silently ran with no floor -
+      # different retrieval behaviour in Docker than on a dev machine.
+      SEARCH_SCORE_THRESHOLD: ${SEARCH_SCORE_THRESHOLD:-}
+      # Must match the dimension the Qdrant collection was created with.
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      EMBEDDING_BATCH_SIZE: ${EMBEDDING_BATCH_SIZE:-100}
+      SPARSE_BATCH_SIZE:    ${SPARSE_BATCH_SIZE:-8}
+      CHUNK_OVERLAP:        ${CHUNK_OVERLAP:-200}
+      LLM_TEMPERATURE:      ${LLM_TEMPERATURE:-0.0}
+      MAP_MAX_TOKENS:       ${MAP_MAX_TOKENS:-512}
+      REDUCE_MAX_TOKENS:    ${REDUCE_MAX_TOKENS:-1024}
+      LLM_REQUEST_TIMEOUT:  ${LLM_REQUEST_TIMEOUT:-120}
+      LLM_MAX_RETRIES:      ${LLM_MAX_RETRIES:-3}
+      DB_POOL_SIZE:         ${DB_POOL_SIZE:-5}
+      DB_MAX_OVERFLOW:      ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT:      ${DB_POOL_TIMEOUT:-30}
+      # Preview links never expire unless a number of seconds is set here.
+      FILE_LINK_TTL_SECONDS: ${FILE_LINK_TTL_SECONDS:-}
+      UNSTRUCTURED_STRATEGY: ${UNSTRUCTURED_STRATEGY:-hi_res}
+      UPLOAD_DIR:           /app/uploaded_files
       DOCUMENTS_DIR:        ./documents
       MIN_CHUNK_SIZE:       ${MIN_CHUNK_SIZE:-100}
       MAX_CHUNK_SIZE:       ${MAX_CHUNK_SIZE:-3000}
-      SUMMARY_MAX_LENGTH:   ${SUMMARY_MAX_LENGTH:-2000}
       SUMMARY_LANGUAGE:     ${SUMMARY_LANGUAGE:-English}
+      # Phase H hardening — all opt-in, empty/wildcard defaults preserve
+      # today's exact behavior for existing callers (see config/settings.py).
+      CORS_ALLOWED_ORIGINS: ${CORS_ALLOWED_ORIGINS:-*}
+      SERVICE_API_KEY:      ${SERVICE_API_KEY:-}
+      SCRAPER_ALLOW_PRIVATE_NETWORKS: ${SCRAPER_ALLOW_PRIVATE_NETWORKS:-false}
       VISION_MODEL:         ${VISION_MODEL:-gpt-4o}
       IMAGE_MIN_SIZE_BYTES: ${IMAGE_MIN_SIZE_BYTES:-5000}
       IMAGE_MAX_DIMENSION:  ${IMAGE_MAX_DIMENSION:-1024}
       IMAGE_MAX_WORKERS:    ${IMAGE_MAX_WORKERS:-4}
+      VISION_ENABLED:       ${VISION_ENABLED:-true}
+      MAX_IMAGES_PER_DOCUMENT: ${MAX_IMAGES_PER_DOCUMENT:-20}
+      VISUAL_CROPS_DIR:     /app/visual_crops
+      STORAGE_S3_BUCKET:    ${STORAGE_S3_BUCKET:-}
+      STORAGE_S3_REGION:    ${STORAGE_S3_REGION:-ap-south-1}
+      STORAGE_S3_KEY_PREFIX: ${STORAGE_S3_KEY_PREFIX:-avabodh/documents}
+      STORAGE_S3_ENDPOINT_URL: ${STORAGE_S3_ENDPOINT_URL:-}
+      STORAGE_LOCAL_TTL_HOURS: ${STORAGE_LOCAL_TTL_HOURS:-4}
+      AWS_ACCESS_KEY_ID:    ${AWS_ACCESS_KEY_ID:-}
+      AWS_SECRET_ACCESS_KEY: ${AWS_SECRET_ACCESS_KEY:-}
+      MAX_ATTACHED_CROPS:   ${MAX_ATTACHED_CROPS:-6}
       # SECRET_KEY signs the document preview file links (GET /documents/{id}/file).
       # The Python-level default is deliberately an obvious placeholder — set a
       # real value here (or in .env) before any production deployment, or the
       # API logs a loud warning on startup and preview links stay forgeable.
       SECRET_KEY:            ${SECRET_KEY:-dev-only-CHANGE-ME-in-production}
+      # Public origin this deployment is reached at - every preview link
+      # is built from it. Blank makes them point at the container's
+      # internal address, which no browser can reach. Set per environment.
+      PUBLIC_BASE_URL:      ${PUBLIC_BASE_URL:-}
       # FILE_LINK_TTL_SECONDS deliberately NOT set here — preview links
       # don't expire by default (see config/settings.py). If a TTL is
       # ever needed again, add FILE_LINK_TTL_SECONDS=<seconds> to .env
@@ -77,18 +121,16 @@ services:
       LOG_LEVEL:            ${LOG_LEVEL:-INFO}
       LOG_FILE:             avabodh.log
       PYTHONIOENCODING:     utf-8
-    depends_on:
-      db:
-        condition: service_healthy
     volumes:
       - uploaded_files:/app/uploaded_files
       - kb_uploaded_files:/app/kb_uploaded_files
       - documents:/app/documents
+      - visual_crops:/app/visual_crops
     healthcheck:
       disable: true
 
 volumes:
-  postgres_data:
   uploaded_files:
+  visual_crops:
   kb_uploaded_files:
   documents:
